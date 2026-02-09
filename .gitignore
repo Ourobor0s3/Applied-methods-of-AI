@@ -11,3 +11,5 @@ wheels/
 /.vscode
 /models
 /Test/data
+.complete
+btc*.csv
