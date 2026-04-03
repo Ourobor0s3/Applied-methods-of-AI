@@ -4,7 +4,7 @@ from pathlib import Path
 FILES1 = "btc_1h_data_2018_to_2025.csv"
 FILES2 = "btc_1d_data_2018_to_2025.csv"
 FILES3 = "btc_4h_data_2018_to_2025.csv"
-FILES4 = "btc_15m_data_2018_to_2025.csv"
+FILES4 = "btc_15m_data.csv"
 FILESBEAR = "bear.csv"
 FILESBULL = "bull.csv"
 
