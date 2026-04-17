@@ -22,5 +22,6 @@ dependencies = [
     "torch>=2.5.0",
     "sentence-transformers>=3.3.0",
     "transformers>=4.40.0",
+    "xgboost>=1.7.0,<3.0.0",
     "tqdm>=4.66.0",
 ]
