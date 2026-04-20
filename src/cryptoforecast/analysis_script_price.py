@@ -1,6 +1,3 @@
-# main.py
-# Основной скрипт — работает с ClearML и без него
-
 import pandas as pd
 import numpy as np
 import torch

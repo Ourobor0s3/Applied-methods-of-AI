@@ -1,6 +1,3 @@
-# main_volatility.py
-# Предсказание волатильности с интеграцией ClearML
-
 import pandas as pd
 import numpy as np
 import torch
@@ -12,7 +9,7 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 import warnings
 import torch.nn.functional as F
 from constants import DATA_BEAR_PATH, DATA_BTC_DAY_PATH, DATA_BULL_PATH
-import matplotlib.pyplot as plt  # 🔹 Перенесено в начало
+import matplotlib.pyplot as plt
 
 warnings.filterwarnings('ignore')
 

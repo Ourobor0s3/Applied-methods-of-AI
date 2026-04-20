@@ -4,10 +4,8 @@ clearml_logger.py
 Если ClearML не установлен или отключён — все методы становятся no-op.
 """
 
-import os
-from typing import Optional, Union, List
+from typing import Optional
 import pandas as pd
-from clearml import Task, Logger
 
 # Флаг включения ClearML
 ENABLE_CLEARML = True  # ← измените на False для отключения

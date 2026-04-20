@@ -12,4 +12,7 @@ wheels/
 /models
 /Test/data
 .complete
+
 *.png
+*.pt
+*.csv
