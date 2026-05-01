@@ -3,7 +3,7 @@
 import os
 import pandas as pd
 from clearml import Dataset
-from constants import DATA_BTC_PATH
+from experiment_config import DATA_BTC_PATH
 
 
 print("=" * 60)

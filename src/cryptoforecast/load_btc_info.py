@@ -1,7 +1,7 @@
 # load_btc_info.py
 
 import kagglehub
-from constants import DATA_DIR
+from experiment_config import DATA_DIR
 
 # Download latest version
 path = kagglehub.dataset_download(

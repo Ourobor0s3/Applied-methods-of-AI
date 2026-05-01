@@ -8,7 +8,7 @@ from typing import Optional
 import pandas as pd
 
 # Флаг включения ClearML
-ENABLE_CLEARML = True  # ← измените на False для отключения
+ENABLE_CLEARML = False  # ← измените на False для отключения
 
 class ClearMLLogger:
     """
@@ -60,13 +60,42 @@ class ClearMLLogger:
             try:
                 self.task.connect_configuration(config, name=name)
             except: pass
-    
+
     def connect_parameters(self, params: dict):
         """Логирование гиперпараметров"""
         if self.enabled and self.task:
             try:
                 self.task.connect(params)
             except: pass
+        # Сохраняем локально для доступа без ClearML
+        self._local_params = getattr(self, '_local_params', {})
+        self._local_params.update(params)
+    
+    def get_parameter(self, key: str, default=None):
+        """
+        Безопасное получение параметра.
+        Работает и с ClearML, и без него.
+        """
+        # Сначала пробуем взять из ClearML (если включён)
+        if self.enabled and self.task:
+            try:
+                # ClearML хранит параметры в task.parameters
+                params = getattr(self.task, 'parameters', {}) or {}
+                if key in params:
+                    return params[key]
+            except: pass
+        
+        # Fallback на локальное хранилище
+        local_params = getattr(self, '_local_params', {})
+        return local_params.get(key, default)
+    
+    def get_parameters(self) -> dict:
+        """Возвращает все параметры (безопасно)"""
+        if self.enabled and self.task:
+            try:
+                return getattr(self.task, 'parameters', {}) or {}
+            except: pass
+        return getattr(self, '_local_params', {}).copy()
     
     # ─────────────────────────────────────────────────────────────
     # Метрики и графики
@@ -182,8 +211,8 @@ def create_logger(
         reuse_last_task_id=reuse_last_task_id
     )
     
-    # Авто-логирование дополнительных параметров из kwargs
-    if kwargs and logger.is_enabled:
+    # Параметры всегда кладём в локальный словарь (для get_parameter без ClearML).
+    if kwargs:
         logger.connect_parameters(kwargs)
-    
+
     return logger

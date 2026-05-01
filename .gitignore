@@ -13,6 +13,4 @@ wheels/
 /Test/data
 .complete
 
-*.png
-*.pt
-*.csv
+/artifacts
