@@ -1,6 +1,6 @@
 # nlp_features.py
 """
-NLP-фичи из заголовков новостей для улучшения прогноза волатильности
+NLP-фичи из заголовков новостей и голосов пользователей для улучшения прогноза волатильности
 """
 import pandas as pd
 import numpy as np
@@ -15,9 +15,17 @@ except ImportError:
     _SENTENCE_TRANSFORMERS_AVAILABLE = False
 
 
+def _safe_log(message: str) -> None:
+    """Печать, устойчивая к ограничениям кодировки консоли."""
+    try:
+        print(message)
+    except UnicodeEncodeError:
+        print(message.encode("ascii", errors="ignore").decode("ascii"))
+
+
 class NewsTitleEncoder:
     """
-    Кодировщик заголовков новостей в векторные эмбеддинги.
+    Кодировщик заголовков новостей и пользовательских голосов в векторные эмбеддинги.
     Поддерживает: Sentence Transformers (рекомендуется) или TF-IDF (fallback).
     """
     
@@ -26,18 +34,19 @@ class NewsTitleEncoder:
         self.use_gpu = use_gpu and _SENTENCE_TRANSFORMERS_AVAILABLE
         self.model = None
         self.is_transformer = False
+        self._is_fitted = False
         
         if _SENTENCE_TRANSFORMERS_AVAILABLE:
             try:
                 device = "cuda" if self.use_gpu else "cpu"
                 self.model = SentenceTransformer(model_name, device=device)
                 self.is_transformer = True
-                print(f"✅ Загружена модель: {model_name} ({device})")
+                _safe_log(f"Loaded model: {model_name} ({device})")
             except Exception as e:
-                print(f"⚠️ Не удалось загрузить SentenceTransformer: {e}")
+                _safe_log(f"Failed to load SentenceTransformer: {e}")
                 self._init_tfidf_fallback()
         else:
-            print("⚠️ sentence-transformers не установлен, используем TF-IDF")
+            _safe_log("sentence-transformers is not installed, using TF-IDF fallback")
             self._init_tfidf_fallback()
     
     def _init_tfidf_fallback(self):
@@ -57,6 +66,7 @@ class NewsTitleEncoder:
         if not self.is_transformer:
             titles_clean = [str(t) if pd.notna(t) else "" for t in titles]
             self.vectorizer.fit(titles_clean)
+            self._is_fitted = True
         return self
     
     def transform(self, titles: List[str]) -> np.ndarray:
@@ -70,6 +80,8 @@ class NewsTitleEncoder:
             return embeddings
         else:
             # TF-IDF fallback
+            if not self._is_fitted:
+                self.fit(titles_clean)
             return self.vectorizer.transform(titles_clean).toarray()
     
     def get_feature_names(self) -> List[str]:
@@ -80,63 +92,96 @@ class NewsTitleEncoder:
             return self.vectorizer.get_feature_names_out().tolist()
 
 
-def aggregate_news_embeddings(df_news: pd.DataFrame, 
-                              encoder: NewsTitleEncoder,
-                              date_col: str = 'datetime',
-                              agg_methods: List[str] = None) -> pd.DataFrame:
+def create_enhanced_vote_features(df_news: pd.DataFrame) -> pd.DataFrame:
     """
-    Агрегация эмбеддингов новостей по дням
+    Создание расширенных признаков на основе пользовательских голосов
+    """
+    df = df_news.copy()
+    
+    # Базовые метрики голосов
+    df['total_votes'] = df['positive_votes'] + df['negative_votes'] + df['important_votes']
+    df['positive_ratio'] = df['positive_votes'] / (df['total_votes'] + 1e-8)
+    df['negative_ratio'] = df['negative_votes'] / (df['total_votes'] + 1e-8)
+    df['important_ratio'] = df['important_votes'] / (df['total_votes'] + 1e-8)
+    
+    # Комбинированный сентимент с весами
+    df['sentiment_weighted'] = (
+        df['positive_votes'] * 1.0 +
+        df['important_votes'] * 0.7 -
+        df['negative_votes'] * 1.2
+    )
+    
+    # Интенсивность реакции (how polarized is the audience)
+    df['reaction_intensity'] = df['total_votes'] / (df['title'].str.len() + 1)
+    
+    # Консенсус/диссонанс (показатель единодушия)
+    df['consensus_score'] = abs(df['positive_votes'] - df['negative_votes']) / (df['total_votes'] + 1e-8)
+    
+    # Активность важности (important votes relative to total)
+    df['importance_activity'] = df['important_votes'] / (df['total_votes'] + 1e-8)
+    
+    return df
+
+
+def aggregate_news_embeddings_with_votes(df_news: pd.DataFrame, 
+                                       encoder: NewsTitleEncoder,
+                                       date_col: str = 'datetime',
+                                       agg_methods: List[str] = None) -> pd.DataFrame:
+    """
+    Агрегация эмбеддингов новостей и голосов по временным периодам
     """
     if agg_methods is None:
-        agg_methods = ['mean', 'max']
+        agg_methods = ['mean', 'max', 'std']
     
     df_news = df_news.copy()
     df_news['date'] = pd.to_datetime(df_news[date_col].dt.date)
     
-    # Фильтруем пустые заголовки
-    df_news = df_news[df_news['title'].notna() & (df_news['title'].str.len() > 0)].copy()
+    # Создаем расширенные признаки голосов
+    df_enhanced = create_enhanced_vote_features(df_news)
     
-    if len(df_news) == 0:
-        print("⚠️ Нет валидных заголовков для NLP-обработки")
+    # Фильтруем пустые заголовки
+    df_enhanced = df_enhanced[df_enhanced['title'].notna() & (df_enhanced['title'].str.len() > 0)].copy()
+    
+    if len(df_enhanced) == 0:
+        _safe_log("No valid titles for NLP processing")
         # Возвращаем пустой DataFrame с нужной колонкой date
         return pd.DataFrame(columns=['date'])
     
     # Кодируем заголовки
-    print(f"🔤 Кодируем {len(df_news)} заголовков...")
-    embeddings = encoder.transform(df_news['title'].tolist())
+    _safe_log(f"Encoding {len(df_enhanced)} titles...")
+    embeddings = encoder.transform(df_enhanced['title'].tolist())
     
     # Добавляем эмбеддинги в DataFrame
     emb_cols = [f"nlp_emb_{i}" for i in range(embeddings.shape[1])]
     for i, col in enumerate(emb_cols):
-        df_news[col] = embeddings[:, i]
+        df_enhanced[col] = embeddings[:, i]
     
-    # 🔹 Агрегация: строим agg_dict ТОЛЬКО для существующих колонок
+    # 🔹 Агgregation: строим agg_dict для всех признаков
     agg_dict = {}
     
-    # Эмбеддинги (они точно есть)
+    # Эмбеддинги
     for col in emb_cols:
         agg_dict[col] = agg_methods
     
-    # Базовые агрегаты — добавляем только если колонка существует
-    available_agg = {}
-    if 'sentiment_score' in df_news.columns:
-        available_agg['sentiment_score'] = ['sum', 'mean', 'std']
-    if 'title' in df_news.columns:
-        available_agg['title'] = 'count'
-    if 'sentiment_abs' in df_news.columns:
-        available_agg['sentiment_abs'] = ['mean', 'max']
+    # Расширенные признаки голосов
+    vote_features = [
+        'sentiment_weighted', 'total_votes', 'positive_ratio', 'negative_ratio', 
+        'important_ratio', 'reaction_intensity', 'consensus_score', 'importance_activity'
+    ]
+    for col in vote_features:
+        if col in df_enhanced.columns:
+            agg_dict[col] = ['sum', 'mean', 'std', 'max']
     
-    agg_dict.update(available_agg)
+    # Базовые агрегаты
+    if 'sentiment_score' in df_enhanced.columns:
+        agg_dict['sentiment_score'] = ['sum', 'mean', 'std']
+    if 'title' in df_enhanced.columns:
+        agg_dict['title'] = 'count'
     
-    # Если ничего не осталось для агрегации — возвращаем минимальный результат
-    if not agg_dict:
-        return df_news[['date']].drop_duplicates().reset_index(drop=True)
+    # Группируем по датам
+    result = df_enhanced.groupby('date').agg(agg_dict).reset_index()
     
-    result = df_news.groupby('date').agg(agg_dict).reset_index()
+    # Плоская структура колонок для совместимости с остальным кодом
+    result.columns = ['_'.join(col).strip() if col[1] else col[0] for col in result.columns.values]
     
-    # Flatten column names
-    result.columns = ['_'.join(col).strip('_') if isinstance(col, tuple) else col 
-                      for col in result.columns]
-    
-    print(f"✅ Создано {len([c for c in result.columns if 'nlp_emb' in c])} NLP-признаков")
     return result

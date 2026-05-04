@@ -25,8 +25,8 @@ DATA_BULL_PATH = DATA_DIR / DATA_FILE_BULL
 
 # --- ClearML ---
 CLEARML_PROJECT_NAME = "CryptoForecast"
-CLEARML_TASK_NAME_PRICE = "price_comparison_v3"
-CLEARML_TASK_NAME_VOLATILITY = "volatility_comparison_v3"
+CLEARML_TASK_NAME_PRICE = "price_comparison_v4"
+CLEARML_TASK_NAME_VOLATILITY = "volatility_comparison_v4"
 CLEARML_REUSE_LAST_TASK_ID = False  # передать в create_logger(..., reuse_last_task_id=...)
 
 # --- Даты и окна ---
@@ -56,8 +56,12 @@ XGBOOST_FLATTEN_BATCH_SIZE = 1024
 
 # --- Стабильность XGBoost/OpenMP (кроссплатформенно) ---
 # Можно менять под ОС/окружение без правок в коде моделей.
+# macOS (особенно Apple Silicon, если были segfault): держите 1 поток.
+# Windows: обычно можно повысить до 2-4 (или до числа физических ядер), если стабильно.
 XGBOOST_N_JOBS = 1
 XGBOOST_NTHREAD = 1
+# macOS: обычно "1" для стабильности OpenMP/libomp.
+# Windows: можно пробовать "2"/"4" и выше при стабильной работе.
 OMP_NUM_THREADS = "1"
 OPENBLAS_NUM_THREADS = "1"
 MKL_NUM_THREADS = "1"

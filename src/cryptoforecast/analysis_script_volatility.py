@@ -64,7 +64,7 @@ from experiment_config import (
     training_config_dict,
 )
 from models_factory import create_model
-from nlp_features import NewsTitleEncoder, aggregate_news_embeddings
+from nlp_features import NewsTitleEncoder, aggregate_news_embeddings_with_votes, create_enhanced_vote_features
 
 warnings.filterwarnings("ignore")
 
@@ -137,17 +137,35 @@ def load_and_prepare_data(
         - all_news["negative_votes"] * 0.8
     )
     all_news["sentiment_abs"] = all_news["sentiment_score"].abs()
+    
+    # Расширенные признаки голосов
+    all_news = create_enhanced_vote_features(all_news)
 
     nlp_cols: list[str] = []
     if use_nlp:
         encoder = NewsTitleEncoder(model_name=NLP_SENTENCE_MODEL_NAME)
-        news_with_emb = aggregate_news_embeddings(all_news, encoder)
+        news_with_emb = aggregate_news_embeddings_with_votes(all_news, encoder)
         news_agg = (
             all_news.groupby(all_news["datetime"].dt.date)
-            .agg({"sentiment_score": ["sum", "mean", "std"], "title": "count"})
+            .agg({
+                "sentiment_score": ["sum", "mean", "std"], 
+                "title": "count",
+                "sentiment_weighted": ["sum", "mean", "std"],
+                "total_votes": ["sum", "mean"],
+                "positive_ratio": ["mean"],
+                "negative_ratio": ["mean"], 
+                "reaction_intensity": ["mean", "std"],
+                "consensus_score": ["mean", "std"]
+            })
             .reset_index()
         )
-        news_agg.columns = ["date", "sentiment_sum", "sentiment_mean", "sentiment_std", "news_count"]
+        news_agg.columns = [
+            "date", "sentiment_sum", "sentiment_mean", "sentiment_std", "news_count",
+            "sentiment_weighted_sum", "sentiment_weighted_mean", "sentiment_weighted_std",
+            "total_votes_sum", "total_votes_mean", "positive_ratio_mean", 
+            "negative_ratio_mean", "reaction_intensity_mean", "reaction_intensity_std",
+            "consensus_score_mean", "consensus_score_std"
+        ]
         news_agg["date"] = pd.to_datetime(news_agg["date"])
         news_daily = news_agg.merge(news_with_emb, on="date", how="left")
         nlp_cols = [c for c in news_daily.columns if "nlp_emb" in c]
@@ -164,9 +182,48 @@ def load_and_prepare_data(
     candles["date"] = pd.to_datetime(candles["Open time"].dt.date)
     df = candles.merge(news_daily, on="date", how="left")
 
-    news_cols = ["sentiment_sum", "sentiment_mean", "sentiment_std", "news_count"]
+    expected_news_cols = [
+        "sentiment_sum",
+        "sentiment_mean",
+        "sentiment_std",
+        "news_count",
+        "sentiment_weighted_sum",
+        "sentiment_weighted_mean",
+        "total_votes_mean",
+        "positive_ratio_mean",
+        "negative_ratio_mean",
+        "reaction_intensity_mean",
+        "consensus_score_mean",
+    ]
+    news_cols = [col for col in expected_news_cols if col in df.columns]
     for col in news_cols + nlp_cols:
         df[col] = df[col].fillna(0)
+    
+    # Логирование новой информации о голосах
+    logger.report_scalar(
+        title="User Votes Analysis",
+        series="Total News Items",
+        value=len(all_news),
+        iteration=0
+    )
+    logger.report_scalar(
+        title="User Votes Analysis", 
+        series="Average Total Votes per News",
+        value=all_news["total_votes"].mean(),
+        iteration=0
+    )
+    logger.report_scalar(
+        title="User Votes Analysis",
+        series="Average Reaction Intensity", 
+        value=all_news["reaction_intensity"].mean(),
+        iteration=0
+    )
+    logger.report_scalar(
+        title="User Votes Analysis",
+        series="Average Consensus Score",
+        value=all_news["consensus_score"].mean(),
+        iteration=0
+    )
 
     if "returns" not in df.columns:
         df["returns"] = df["Close"].pct_change()
@@ -202,7 +259,12 @@ class VolatilitySequenceDataset(Dataset):
     ):
         self.sequence_length = sequence_length
         feature_cols = feature_cols or ["returns", "volatility", "volume_ratio", "price_range", "macd", "rsi"]
-        news_cols = news_cols or ["sentiment_sum", "sentiment_mean", "sentiment_std", "news_count"]
+        news_cols = news_cols or [
+            "sentiment_sum", "sentiment_mean", "sentiment_std", "news_count",
+            "sentiment_weighted_sum", "sentiment_weighted_mean", "total_votes_mean",
+            "positive_ratio_mean", "negative_ratio_mean", "reaction_intensity_mean",
+            "consensus_score_mean"
+        ]
         nlp_cols = nlp_cols or []
 
         self.scaler_price = RobustScaler()
