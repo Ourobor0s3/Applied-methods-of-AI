@@ -54,6 +54,14 @@ HIDDEN_DIM_LIQUID = 48
 HUBER_LOSS_DELTA = 0.5
 XGBOOST_FLATTEN_BATCH_SIZE = 1024
 
+# --- Стабильность XGBoost/OpenMP (кроссплатформенно) ---
+# Можно менять под ОС/окружение без правок в коде моделей.
+XGBOOST_N_JOBS = 1
+XGBOOST_NTHREAD = 1
+OMP_NUM_THREADS = "1"
+OPENBLAS_NUM_THREADS = "1"
+MKL_NUM_THREADS = "1"
+
 # --- Технические индикаторы (свечи) ---
 ROLLING_VOLATILITY_SHORT = 5
 VOLUME_MA_WINDOW = 5
@@ -98,6 +106,11 @@ def clearml_base_parameters() -> dict:
         "hidden_dim_default": HIDDEN_DIM_DEFAULT,
         "hidden_dim_liquid": HIDDEN_DIM_LIQUID,
         "huber_loss_delta": HUBER_LOSS_DELTA,
+        "xgboost_n_jobs": XGBOOST_N_JOBS,
+        "xgboost_nthread": XGBOOST_NTHREAD,
+        "omp_num_threads": OMP_NUM_THREADS,
+        "openblas_num_threads": OPENBLAS_NUM_THREADS,
+        "mkl_num_threads": MKL_NUM_THREADS,
         "artifacts_dir": ARTIFACTS_DIR,
     }
 

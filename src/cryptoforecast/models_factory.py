@@ -3,12 +3,25 @@
 Фабрика моделей: Liquid, ResNet1D, DenseNet1D, XGBoost
 Единый интерфейс для обучения и сравнения
 """
+import os
 import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional
 import numpy as np
+from experiment_config import (
+    MKL_NUM_THREADS,
+    OMP_NUM_THREADS,
+    OPENBLAS_NUM_THREADS,
+    XGBOOST_N_JOBS,
+    XGBOOST_NTHREAD,
+)
+
+# Ограничиваем OpenMP-параллелизм для стабильности XGBoost (особенно на macOS).
+os.environ.setdefault("OMP_NUM_THREADS", OMP_NUM_THREADS)
+os.environ.setdefault("OPENBLAS_NUM_THREADS", OPENBLAS_NUM_THREADS)
+os.environ.setdefault("MKL_NUM_THREADS", MKL_NUM_THREADS)
 
 try:
     import xgboost as xgb
@@ -225,7 +238,8 @@ class XGBoostVolatilityPredictor:
             'tree_method': 'hist',  # быстрее для больших данных
             'early_stopping_rounds': 20,
             'random_state': 42,
-            'n_jobs': -1
+            'n_jobs': XGBOOST_N_JOBS,
+            'nthread': XGBOOST_NTHREAD,
         }
         default_params.update(xgb_params)
         self.params = default_params
