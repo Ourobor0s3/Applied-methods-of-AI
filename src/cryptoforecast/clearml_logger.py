@@ -8,7 +8,7 @@ from typing import Optional
 import pandas as pd
 
 # Флаг включения ClearML
-ENABLE_CLEARML = False  # ← измените на False для отключения
+ENABLE_CLEARML = True  # ← измените на False для отключения
 
 class ClearMLLogger:
     """
