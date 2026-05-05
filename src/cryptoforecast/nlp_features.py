@@ -6,6 +6,8 @@ import pandas as pd
 import numpy as np
 from typing import List, Optional
 import warnings
+import subprocess
+import json
 warnings.filterwarnings('ignore')
 
 try:
@@ -13,6 +15,12 @@ try:
     _SENTENCE_TRANSFORMERS_AVAILABLE = True
 except ImportError:
     _SENTENCE_TRANSFORMERS_AVAILABLE = False
+
+try:
+    import ollama
+    _OLLAMA_AVAILABLE = True
+except ImportError:
+    _OLLAMA_AVAILABLE = False
 
 
 def _safe_log(message: str) -> None:
@@ -26,7 +34,7 @@ def _safe_log(message: str) -> None:
 class NewsTitleEncoder:
     """
     Кодировщик заголовков новостей и пользовательских голосов в векторные эмбеддинги.
-    Поддерживает: Sentence Transformers (рекомендуется) или TF-IDF (fallback).
+    Поддерживает: Ollama, Sentence Transformers или TF-IDF (fallback).
     """
     
     def __init__(self, model_name: str = "paraphrase-MiniLM-L6-v2", use_gpu: bool = False):
@@ -34,19 +42,45 @@ class NewsTitleEncoder:
         self.use_gpu = use_gpu and _SENTENCE_TRANSFORMERS_AVAILABLE
         self.model = None
         self.is_transformer = False
+        self.is_ollama = False
         self._is_fitted = False
+        self.embedding_dim = None
         
-        if _SENTENCE_TRANSFORMERS_AVAILABLE:
-            try:
-                device = "cuda" if self.use_gpu else "cpu"
-                self.model = SentenceTransformer(model_name, device=device)
-                self.is_transformer = True
-                _safe_log(f"Loaded model: {model_name} ({device})")
-            except Exception as e:
-                _safe_log(f"Failed to load SentenceTransformer: {e}")
-                self._init_tfidf_fallback()
+        # Проверяем Ollama (модели с ':' в имени, например "qwen3-embedding:0.6b")
+        if ":" in model_name:
+            if _OLLAMA_AVAILABLE:
+                try:
+                    response = ollama.embed(model=model_name, input="test")
+                    self.is_ollama = True
+                    self.embedding_dim = len(response['embeddings'][0])
+                    _safe_log(f"Loaded Ollama model: {model_name}, dim={self.embedding_dim}")
+                    return
+                except Exception as e:
+                    error_msg = str(e).lower()
+                    if "not found" in error_msg:
+                        _safe_log(f"Ollama model not found: {model_name}. Pull with: ollama pull {model_name}")
+                    else:
+                        _safe_log(f"Ollama error: {e}")
+            # Если Ollama недоступен или модель не найдена -> TF-IDF
+            _safe_log("Using TF-IDF fallback")
+            self._init_tfidf_fallback()
+        # Пробуем Sentence Transformers для обычных имен (paraphrase-MiniLM-L6-v2, Qwen/Qwen3-Embedding-0.5B)
+        elif _SENTENCE_TRANSFORMERS_AVAILABLE:
+            self._try_sentence_transformer()
         else:
-            _safe_log("sentence-transformers is not installed, using TF-IDF fallback")
+            _safe_log("Using TF-IDF fallback")
+            self._init_tfidf_fallback()
+    
+    def _try_sentence_transformer(self):
+        """Попытка загрузить Sentence Transformer."""
+        try:
+            device = "cuda" if self.use_gpu else "cpu"
+            self.model = SentenceTransformer(self.model_name, device=device)
+            self.is_transformer = True
+            self.embedding_dim = self.model.get_sentence_embedding_dimension()
+            _safe_log(f"Loaded SentenceTransformer: {self.model_name} ({device}), dim={self.embedding_dim}")
+        except Exception as e:
+            _safe_log(f"Failed to load SentenceTransformer: {e}")
             self._init_tfidf_fallback()
     
     def _init_tfidf_fallback(self):
@@ -56,7 +90,7 @@ class NewsTitleEncoder:
             max_features=50,
             ngram_range=(1, 2),
             stop_words='english',
-            min_df=2,
+            min_df=1,
             max_df=0.95
         )
         self.is_transformer = False
@@ -73,10 +107,22 @@ class NewsTitleEncoder:
         """Преобразование заголовков в эмбеддинги"""
         titles_clean = [str(t) if pd.notna(t) else "" for t in titles]
         
-        if self.is_transformer and self.model:
-            # Sentence Transformer: фиксированная размерность (384 для MiniLM)
+        if self.is_ollama:
+            # Ollama embeddings
+            all_embeddings = []
+            batch_size = 32
+            for i in range(0, len(titles_clean), batch_size):
+                batch = titles_clean[i:i+batch_size]
+                try:
+                    response = ollama.embed(model=self.model_name, input=batch)
+                    all_embeddings.extend(response['embeddings'])
+                except Exception as e:
+                    _safe_log(f"Ollama batch error: {e}")
+                    all_embeddings.extend([[0.0] * self.embedding_dim] * len(batch))
+            return np.array(all_embeddings)
+        elif self.is_transformer and self.model:
+            # Sentence Transformer
             embeddings = self.model.encode(titles_clean, show_progress_bar=False, batch_size=32)
-            # Добавляем статистики для агрегации по дням
             return embeddings
         else:
             # TF-IDF fallback
@@ -86,8 +132,8 @@ class NewsTitleEncoder:
     
     def get_feature_names(self) -> List[str]:
         """Названия фич для интерпретации"""
-        if self.is_transformer:
-            return [f"title_emb_{i}" for i in range(384)]  # MiniLM dimension
+        if self.embedding_dim:
+            return [f"title_emb_{i}" for i in range(self.embedding_dim)]
         else:
             return self.vectorizer.get_feature_names_out().tolist()
 
@@ -123,12 +169,28 @@ def create_enhanced_vote_features(df_news: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def reduce_embedding_dimension(embeddings: np.ndarray, max_dim: int = 64) -> np.ndarray:
+    """Уменьшение размерности эмбеддингов через PCA."""
+    if embeddings.shape[1] <= max_dim:
+        return embeddings
+    
+    try:
+        from sklearn.decomposition import PCA
+        pca = PCA(n_components=max_dim, random_state=42)
+        return pca.fit_transform(embeddings)
+    except Exception:
+        # Fallback: просто берем первые max_dim признаков
+        return embeddings[:, :max_dim]
+
+
 def aggregate_news_embeddings_with_votes(df_news: pd.DataFrame, 
                                        encoder: NewsTitleEncoder,
                                        date_col: str = 'datetime',
-                                       agg_methods: List[str] = None) -> pd.DataFrame:
+                                       agg_methods: List[str] = None,
+                                       max_emb_dim: int = 64) -> pd.DataFrame:
     """
-    Агрегация эмбеддингов новостей и голосов по временным периодам
+    Агрегация эмбеддингов новостей и голосов по временным периодам.
+    max_emb_dim: максимальная размерность эмбеддингов (для избежания переполнения памяти)
     """
     if agg_methods is None:
         agg_methods = ['mean', 'max', 'std']
@@ -150,6 +212,11 @@ def aggregate_news_embeddings_with_votes(df_news: pd.DataFrame,
     # Кодируем заголовки
     _safe_log(f"Encoding {len(df_enhanced)} titles...")
     embeddings = encoder.transform(df_enhanced['title'].tolist())
+    
+    # Уменьшаем размерность если слишком много
+    if embeddings.shape[1] > max_emb_dim:
+        _safe_log(f"Reducing embedding dim: {embeddings.shape[1]} -> {max_emb_dim}")
+        embeddings = reduce_embedding_dimension(embeddings, max_emb_dim)
     
     # Добавляем эмбеддинги в DataFrame
     emb_cols = [f"nlp_emb_{i}" for i in range(embeddings.shape[1])]

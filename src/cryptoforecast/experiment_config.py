@@ -25,9 +25,25 @@ DATA_BULL_PATH = DATA_DIR / DATA_FILE_BULL
 
 # --- ClearML ---
 CLEARML_PROJECT_NAME = "CryptoForecast"
-CLEARML_TASK_NAME_PRICE = "price_comparison_v4"
-CLEARML_TASK_NAME_VOLATILITY = "volatility_comparison_v4"
-CLEARML_REUSE_LAST_TASK_ID = False  # передать в create_logger(..., reuse_last_task_id=...)
+CLEARML_TASK_VERSION = "v5"
+CLEARML_REUSE_LAST_TASK_ID = False
+
+# --- Модели для сравнения и тип задачи (должны быть до функций) ---
+# Изменить здесь:
+#   TASK_TYPE: "regression" (MAE, RMSE, R2) или "classification" (ROC AUC, Accuracy, F1)
+#   MODELS_TO_TEST: какие модели тестировать ["liquid", "densenet", "resnet", "xgboost"]
+TASK_TYPE = "regression"
+MODELS_TO_TEST = ["liquid", "densenet", "resnet", "xgboost"]
+CLASSIFICATION_THRESHOLD = 0.5
+
+# Динамические имена задач (формируются из MODELS_TO_TEST + TASK_TYPE)
+def _make_task_name(prefix: str, models: list, task_type: str, version: str) -> str:
+    """Создает имя задачи: price_[models]_[task_type]_vX"""
+    models_str = "_".join(sorted(models))  # liquid_densenet_resnet_xgboost
+    return f"{prefix}_{models_str}_{task_type}_{version}"
+
+CLEARML_TASK_NAME_PRICE = _make_task_name("price", MODELS_TO_TEST, TASK_TYPE, CLEARML_TASK_VERSION)
+CLEARML_TASK_NAME_VOLATILITY = _make_task_name("volatility", MODELS_TO_TEST, TASK_TYPE, CLEARML_TASK_VERSION)
 
 # --- Даты и окна ---
 DATA_START_DATE = "2025-01-16"
@@ -37,10 +53,16 @@ VOLATILITY_WINDOW = 5
 
 # --- NLP ---
 USE_NLP = True
-NLP_SENTENCE_MODEL_NAME = "paraphrase-MiniLM-L6-v2"
+USE_NEWS_FILTER = True
 
-# --- Модели для сравнения (имена совпадают с models_factory.create_model) ---
-MODELS_TO_TEST = ["liquid", "densenet", "resnet", "xgboost"]
+# Для Ollama: "qwen3-embedding:0.6b" или "mxbai-embed-large"
+# Для установки olama нужно запустить скрипты (для макича):
+# curl -fsSL https://ollama.com/install.sh | sh
+# ollama pull qwen3-embedding:0.6b
+# Для sentence-transformers: "Qwen/Qwen3-Embedding-0.5B" или "paraphrase-MiniLM-L6-v2"
+NLP_SENTENCE_MODEL_NAME = "qwen3-embedding:0.6b" # paraphrase-MiniLM-L6-v2
+# Максимальная размерность эмбеддингов после PCA (для избежания переполнения памяти в XGBoost)
+NLP_MAX_EMBEDDING_DIM = 64
 
 # --- Обучение (общие имена для логов и конфигов) ---
 SEQUENCE_LENGTH = 25
@@ -75,9 +97,6 @@ EMA_SLOW = 26
 
 # --- Артефакты (относительно текущей рабочей директории при запуске) ---
 ARTIFACTS_DIR = "artifacts"
-BEST_MODEL_SELECTION_METRIC_PRICE = "roc_auc"
-BEST_MODEL_SELECTION_METRIC_VOLATILITY = "r2"
-CLASSIFICATION_THRESHOLD = 0.5
 
 # --- Имена для отчётов ClearML (единый словарь, чтобы не разъезжались строки) ---
 CLEARML_CONFIG_RUN = "run"
@@ -95,7 +114,10 @@ def clearml_base_parameters() -> dict:
     """Параметры задачи ClearML: одни и те же ключи для price и volatility, где возможно."""
     return {
         "models_to_test": MODELS_TO_TEST,
+        "task_type_param": TASK_TYPE,
+        "classification_threshold": CLASSIFICATION_THRESHOLD,
         "use_nlp": USE_NLP,
+        "use_news_filter": USE_NEWS_FILTER,
         "nlp_sentence_model_name": NLP_SENTENCE_MODEL_NAME,
         "data_start_date": DATA_START_DATE,
         "data_end_date": DATA_END_DATE,

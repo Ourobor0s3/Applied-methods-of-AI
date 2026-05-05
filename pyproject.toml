@@ -13,6 +13,7 @@ dependencies = [
     "kagglehub>=0.4.3",
     "matplotlib>=3.10.6",
     "numpy>=1.16.0,<2.2",
+    "ollama>=0.1.0",
     "pandas>=2.3.3",
     "plotly>=6.3.1",
     "scikit-learn>=1.7.1",

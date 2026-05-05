@@ -14,7 +14,6 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.preprocessing import RobustScaler
 from torch.utils.data import DataLoader, Dataset
@@ -23,7 +22,6 @@ from clearml_logger import create_logger
 from experiment_config import (
     ARTIFACTS_DIR,
     BATCH_SIZE,
-    BEST_MODEL_SELECTION_METRIC_VOLATILITY,
     CLEARML_CONFIG_DATA,
     CLEARML_CONFIG_RUN,
     CLEARML_CONFIG_TRAINING_PREFIX,
@@ -47,9 +45,12 @@ from experiment_config import (
     HIDDEN_DIM_DEFAULT,
     HIDDEN_DIM_LIQUID,
     HUBER_LOSS_DELTA,
+    TASK_TYPE,
+    CLASSIFICATION_THRESHOLD,
     LEARNING_RATE,
     MODELS_TO_TEST,
     NLP_SENTENCE_MODEL_NAME,
+    NLP_MAX_EMBEDDING_DIM,
     RSI_WINDOW,
     SEQUENCE_LENGTH,
     TIME_SERIES_CV_SPLITS,
@@ -65,6 +66,7 @@ from experiment_config import (
 )
 from models_factory import create_model
 from nlp_features import NewsTitleEncoder, aggregate_news_embeddings_with_votes, create_enhanced_vote_features
+from unified_metrics import calculate_metrics, get_metrics_config, get_primary_metric_value
 
 warnings.filterwarnings("ignore")
 
@@ -144,7 +146,7 @@ def load_and_prepare_data(
     nlp_cols: list[str] = []
     if use_nlp:
         encoder = NewsTitleEncoder(model_name=NLP_SENTENCE_MODEL_NAME)
-        news_with_emb = aggregate_news_embeddings_with_votes(all_news, encoder)
+        news_with_emb = aggregate_news_embeddings_with_votes(all_news, encoder, max_emb_dim=NLP_MAX_EMBEDDING_DIM)
         news_agg = (
             all_news.groupby(all_news["datetime"].dt.date)
             .agg({
@@ -342,19 +344,25 @@ def train_one_model(
         model.fit(x_train, y_train, x_val, y_val, feature_names=feat_names)
 
         preds = model.predict(x_val)
-        mae = mean_absolute_error(y_val, preds)
-        rmse = float(np.sqrt(mean_squared_error(y_val, preds)))
-        r2 = r2_score(y_val, preds)
-
+        y_true = y_val
+        
+        # Unified regression metrics
+        metrics = calculate_metrics(y_true, preds, task_type=TASK_TYPE, threshold=CLASSIFICATION_THRESHOLD)
+        
+        # Важность признаков
         importance = model.get_feature_importance(top_n=30)
         if not importance.empty:
             logger.report_table(CLEARML_TITLE_FEATURE_IMPORTANCE, model_name, importance.round(4), 0)
 
-        logger.report_scalar(CLEARML_TITLE_METRICS_FINAL, f"{model_name}.mae", mae, 0)
-        logger.report_scalar(CLEARML_TITLE_METRICS_FINAL, f"{model_name}.rmse", rmse, 0)
-        logger.report_scalar(CLEARML_TITLE_METRICS_FINAL, f"{model_name}.r2", r2, 0)
-        print(f"volatility | model={model_name} | mae={mae:.6f} | rmse={rmse:.6f} | r2={r2:.4f}")
-        return model, preds, y_val, mae, rmse, r2, train_ds
+        # Логирование всех метрик
+        for metric_name, value in metrics.items():
+            logger.report_scalar(CLEARML_TITLE_METRICS_FINAL, f"{model_name}.{metric_name}", value, 0)
+        
+        # Print all metrics
+        metrics_str = " | ".join([f"{k}={v:.4f}" for k, v in metrics.items()])
+        print(f"volatility | model={model_name} | {metrics_str}")
+        
+        return model, preds, y_true, metrics, train_ds
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     hidden = HIDDEN_DIM_LIQUID if model_name == "liquid" else HIDDEN_DIM_DEFAULT
@@ -394,23 +402,25 @@ def train_one_model(
 
         preds_arr = np.asarray(preds_list)
         y_true = np.asarray(targets_list)
-        mae = mean_absolute_error(y_true, preds_arr)
-        rmse = float(np.sqrt(mean_squared_error(y_true, preds_arr)))
-        r2 = r2_score(y_true, preds_arr)
+        
+        # Unified metrics based on TASK_TYPE
+        metrics = calculate_metrics(y_true, preds_arr, task_type=TASK_TYPE, threshold=CLASSIFICATION_THRESHOLD)
 
         it = epoch + 1
-        logger.report_scalar(CLEARML_TITLE_METRICS_EPOCH, f"{model_name}.mae", mae, it)
-        logger.report_scalar(CLEARML_TITLE_METRICS_EPOCH, f"{model_name}.rmse", rmse, it)
-        logger.report_scalar(CLEARML_TITLE_METRICS_EPOCH, f"{model_name}.r2", r2, it)
+        
+        # Логирование всех метрик за эпоху
+        for metric_name, value in metrics.items():
+            logger.report_scalar(CLEARML_TITLE_METRICS_EPOCH, f"{model_name}.{metric_name}", value, it)
 
         if epoch % 10 == 0:
-            print(f"volatility | model={model_name} | epoch={it} | mae={mae:.6f} | rmse={rmse:.6f} | r2={r2:.4f}")
+            metrics_str = " | ".join([f"{k}={v:.4f}" for k, v in metrics.items()])
+            print(f"volatility | model={model_name} | epoch={it} | {metrics_str}")
 
-    logger.report_scalar(CLEARML_TITLE_METRICS_FINAL, f"{model_name}.mae", mae, 0)
-    logger.report_scalar(CLEARML_TITLE_METRICS_FINAL, f"{model_name}.rmse", rmse, 0)
-    logger.report_scalar(CLEARML_TITLE_METRICS_FINAL, f"{model_name}.r2", r2, 0)
+    # Финальное логирование
+    for metric_name, value in metrics.items():
+        logger.report_scalar(CLEARML_TITLE_METRICS_FINAL, f"{model_name}.{metric_name}", value, 0)
 
-    return model, preds_arr, y_true, mae, rmse, r2, train_ds
+    return model, preds_arr, y_true, metrics, train_ds
 
 
 def save_best_model_bundle(
@@ -452,15 +462,12 @@ def save_best_model_bundle(
     ).to_csv(preds_path, index=False)
 
     meta = {
-        "task": "volatility_regression",
+        "task": f"volatility_{TASK_TYPE}",
+        "task_type": TASK_TYPE,
         "best_model_name": name,
-        "selection_metric": BEST_MODEL_SELECTION_METRIC_VOLATILITY,
+        "selection_metric": get_metrics_config(TASK_TYPE)['primary_metric'],
         "target_column": TARGET_COLUMN,
-        "best_metrics": {
-            "mae": float(best["mae"]),
-            "rmse": float(best["rmse"]),
-            "r2": float(best["r2"]),
-        },
+        "best_metrics": metrics,
         "feature_columns": feature_cols,
         "news_columns": news_cols,
         "nlp_columns": nlp_cols,
@@ -508,7 +515,7 @@ if __name__ == "__main__":
 
     for model_name in models_to_test:
         print(f"\nTraining: {model_name}")
-        model, preds, targets, mae, rmse, r2, train_ds = train_one_model(
+        model, preds, targets, metrics, train_ds = train_one_model(
             df,
             model_name,
             feat_cols,
@@ -519,21 +526,32 @@ if __name__ == "__main__":
             learning_rate=lr,
             sequence_length=seq_len,
         )
-        results[model_name] = {"mae": mae, "rmse": rmse, "r2": r2, "preds": preds, "targets": targets}
+        results[model_name] = {
+            "metrics": metrics,
+            "preds": preds,
+            "targets": targets
+        }
 
-        logger.report_scalar(CLEARML_TITLE_COMPARISON, comparison_scalar_series("r2", model_name), r2, 0)
-        logger.report_scalar(CLEARML_TITLE_COMPARISON, comparison_scalar_series("mae", model_name), mae, 0)
-        logger.report_scalar(CLEARML_TITLE_COMPARISON, comparison_scalar_series("rmse", model_name), rmse, 0)
+        # Логирование всех метрик для сравнения
+        for metric_name, value in metrics.items():
+            logger.report_scalar(
+                CLEARML_TITLE_COMPARISON,
+                comparison_scalar_series(metric_name, model_name),
+                value,
+                0,
+            )
 
-        if best is None or r2 > best["r2"]:
+        # Выбор лучшей модели по основной метрике
+        current_value = get_primary_metric_value(metrics, TASK_TYPE)
+        best_value = get_primary_metric_value(best["metrics"], TASK_TYPE) if best else float('-inf')
+        
+        if best is None or current_value > best_value:
             best = {
                 "model_name": model_name,
                 "model": model,
+                "metrics": metrics,
                 "preds": preds,
                 "targets": targets,
-                "mae": mae,
-                "rmse": rmse,
-                "r2": r2,
                 "sequence_length": seq_len,
                 "train_ds": train_ds,
             }
@@ -541,11 +559,11 @@ if __name__ == "__main__":
     comparison_df = (
         pd.DataFrame(
             [
-                {"model_name": m, "mae": results[m]["mae"], "rmse": results[m]["rmse"], "r2": results[m]["r2"]}
+                results[m]["metrics"]
                 for m in results
             ]
         )
-        .sort_values("r2", ascending=False)
+        .sort_values(get_metrics_config(TASK_TYPE)['primary_metric'], ascending=False)
         .reset_index(drop=True)
     )
 
@@ -556,9 +574,11 @@ if __name__ == "__main__":
     logger.report_table("model_comparison_table", "summary", comparison_df.round(4), 0)
     logger.upload_artifact("volatility_model_comparison_csv", comparison_path)
 
-    print("\nModel comparison (sorted by r2):")
+    print(f"\nModel comparison (sorted by {get_metrics_config(TASK_TYPE)['primary_metric']}):")
     print(comparison_df.to_string(index=False))
-    print(f"\nBest model: {best['model_name']} | r2={best['r2']:.4f}")
+    
+    best_metrics_str = " | ".join([f"{k}={v:.4f}" for k, v in best["metrics"].items()])
+    print(f"\nBest model: {best['model_name']} | {best_metrics_str}")
 
     save_best_model_bundle(best, feat_cols, news_cols, nlp_cols)
 
