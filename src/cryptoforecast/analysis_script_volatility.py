@@ -45,7 +45,7 @@ from experiment_config import (
     HIDDEN_DIM_DEFAULT,
     HIDDEN_DIM_LIQUID,
     HUBER_LOSS_DELTA,
-    TASK_TYPE,
+    TASK_TYPE_VOLATILITY,
     CLASSIFICATION_THRESHOLD,
     LEARNING_RATE,
     MODELS_TO_TEST,
@@ -347,7 +347,7 @@ def train_one_model(
         y_true = y_val
         
         # Unified regression metrics
-        metrics = calculate_metrics(y_true, preds, task_type=TASK_TYPE, threshold=CLASSIFICATION_THRESHOLD)
+        metrics = calculate_metrics(y_true, preds, task_type=TASK_TYPE_VOLATILITY, threshold=CLASSIFICATION_THRESHOLD)
         
         # Важность признаков
         importance = model.get_feature_importance(top_n=30)
@@ -403,8 +403,8 @@ def train_one_model(
         preds_arr = np.asarray(preds_list)
         y_true = np.asarray(targets_list)
         
-        # Unified metrics based on TASK_TYPE
-        metrics = calculate_metrics(y_true, preds_arr, task_type=TASK_TYPE, threshold=CLASSIFICATION_THRESHOLD)
+        # Unified metrics based on TASK_TYPE_VOLATILITY
+        metrics = calculate_metrics(y_true, preds_arr, task_type=TASK_TYPE_VOLATILITY, threshold=CLASSIFICATION_THRESHOLD)
 
         it = epoch + 1
         
@@ -462,10 +462,10 @@ def save_best_model_bundle(
     ).to_csv(preds_path, index=False)
 
     meta = {
-        "task": f"volatility_{TASK_TYPE}",
-        "task_type": TASK_TYPE,
+        "task": f"volatility_{TASK_TYPE_VOLATILITY}",
+        "task_type": TASK_TYPE_VOLATILITY,
         "best_model_name": name,
-        "selection_metric": get_metrics_config(TASK_TYPE)['primary_metric'],
+        "selection_metric": get_metrics_config(TASK_TYPE_VOLATILITY)['primary_metric'],
         "target_column": TARGET_COLUMN,
         "best_metrics": metrics,
         "feature_columns": feature_cols,
@@ -542,8 +542,8 @@ if __name__ == "__main__":
             )
 
         # Выбор лучшей модели по основной метрике
-        current_value = get_primary_metric_value(metrics, TASK_TYPE)
-        best_value = get_primary_metric_value(best["metrics"], TASK_TYPE) if best else float('-inf')
+        current_value = get_primary_metric_value(metrics, TASK_TYPE_VOLATILITY)
+        best_value = get_primary_metric_value(best["metrics"], TASK_TYPE_VOLATILITY) if best else float('-inf')
         
         if best is None or current_value > best_value:
             best = {
@@ -563,7 +563,7 @@ if __name__ == "__main__":
                 for m in results
             ]
         )
-        .sort_values(get_metrics_config(TASK_TYPE)['primary_metric'], ascending=False)
+        .sort_values(get_metrics_config(TASK_TYPE_VOLATILITY)['primary_metric'], ascending=False)
         .reset_index(drop=True)
     )
 
@@ -574,7 +574,7 @@ if __name__ == "__main__":
     logger.report_table("model_comparison_table", "summary", comparison_df.round(4), 0)
     logger.upload_artifact("volatility_model_comparison_csv", comparison_path)
 
-    print(f"\nModel comparison (sorted by {get_metrics_config(TASK_TYPE)['primary_metric']}):")
+    print(f"\nModel comparison (sorted by {get_metrics_config(TASK_TYPE_VOLATILITY)['primary_metric']}):")
     print(comparison_df.to_string(index=False))
     
     best_metrics_str = " | ".join([f"{k}={v:.4f}" for k, v in best["metrics"].items()])

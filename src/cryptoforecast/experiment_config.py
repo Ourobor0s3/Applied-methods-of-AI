@@ -32,8 +32,9 @@ CLEARML_REUSE_LAST_TASK_ID = False
 # Изменить здесь:
 #   TASK_TYPE: "regression" (MAE, RMSE, R2) или "classification" (ROC AUC, Accuracy, F1)
 #   MODELS_TO_TEST: какие модели тестировать ["liquid", "densenet", "resnet", "xgboost"]
-TASK_TYPE = "regression"
-MODELS_TO_TEST = ["liquid", "densenet", "resnet", "xgboost"]
+TASK_TYPE_PRICE = "classification"
+TASK_TYPE_VOLATILITY = "regression"
+MODELS_TO_TEST = ["densenet"]
 CLASSIFICATION_THRESHOLD = 0.5
 
 # Динамические имена задач (формируются из MODELS_TO_TEST + TASK_TYPE)
@@ -42,8 +43,8 @@ def _make_task_name(prefix: str, models: list, task_type: str, version: str) -> 
     models_str = "_".join(sorted(models))  # liquid_densenet_resnet_xgboost
     return f"{prefix}_{models_str}_{task_type}_{version}"
 
-CLEARML_TASK_NAME_PRICE = _make_task_name("price", MODELS_TO_TEST, TASK_TYPE, CLEARML_TASK_VERSION)
-CLEARML_TASK_NAME_VOLATILITY = _make_task_name("volatility", MODELS_TO_TEST, TASK_TYPE, CLEARML_TASK_VERSION)
+CLEARML_TASK_NAME_PRICE = _make_task_name("price", MODELS_TO_TEST, TASK_TYPE_PRICE, CLEARML_TASK_VERSION)
+CLEARML_TASK_NAME_VOLATILITY = _make_task_name("volatility", MODELS_TO_TEST, TASK_TYPE_VOLATILITY, CLEARML_TASK_VERSION)
 
 # --- Даты и окна ---
 DATA_START_DATE = "2025-01-16"
@@ -114,7 +115,6 @@ def clearml_base_parameters() -> dict:
     """Параметры задачи ClearML: одни и те же ключи для price и volatility, где возможно."""
     return {
         "models_to_test": MODELS_TO_TEST,
-        "task_type_param": TASK_TYPE,
         "classification_threshold": CLASSIFICATION_THRESHOLD,
         "use_nlp": USE_NLP,
         "use_news_filter": USE_NEWS_FILTER,

@@ -44,7 +44,7 @@ from experiment_config import (
     HIDDEN_DIM_DEFAULT,
     HIDDEN_DIM_LIQUID,
     CLASSIFICATION_THRESHOLD,
-    TASK_TYPE,
+    TASK_TYPE_PRICE,
     LEARNING_RATE,
     MODELS_TO_TEST,
     NLP_SENTENCE_MODEL_NAME,
@@ -169,7 +169,7 @@ def load_and_prepare_data(
     
     # Regression: предсказываем процент изменения (-1 to 1 примерно)
     # Classification: предсказываем 1 если рост, 0 если падение
-    if TASK_TYPE == "classification":
+    if TASK_TYPE_PRICE == "classification":
         df["target"] = (df["future_close"] > df["Close"]).astype(int)
     else:
         # Regression: используем процент изменения как таргет
@@ -178,7 +178,7 @@ def load_and_prepare_data(
     feature_cols = ["returns", "volatility", "volume_ratio", "price_range", "macd", "rsi"]
     df = df.dropna(subset=feature_cols + news_cols + nlp_cols + ["future_close"]).reset_index(drop=True)
 
-    if TASK_TYPE == "classification":
+    if TASK_TYPE_PRICE == "classification":
         positive_ratio_pct = float(df["target"].mean() * 100)
         logger.report_scalar(CLEARML_TITLE_DATASET, "sample_count", float(len(df)), 0)
         logger.report_scalar(CLEARML_TITLE_DATASET, "positive_class_ratio_pct", positive_ratio_pct, 0)
@@ -285,15 +285,15 @@ def train_one_model(
         raw = model.predict(x_val)
         
         # For classification: clip to 0-1 (probability), for regression: use raw values
-        if TASK_TYPE == "classification":
+        if TASK_TYPE_PRICE == "classification":
             probs = np.clip(raw, 0.0, 1.0)
         else:
             probs = raw  # regression: keep continuous values (returns)
         
         y_true = y_val
         
-        # Unified metrics based on TASK_TYPE
-        metrics = calculate_metrics(y_true, probs, task_type=TASK_TYPE, threshold=CLASSIFICATION_THRESHOLD)
+        # Unified metrics based on TASK_TYPE_PRICE
+        metrics = calculate_metrics(y_true, probs, TASK_TYPE_PRICE=TASK_TYPE_PRICE, threshold=CLASSIFICATION_THRESHOLD)
         
         # Dynamic logging of all metrics
         for metric_name, value in metrics.items():
@@ -321,7 +321,7 @@ def train_one_model(
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=training_epochs)
     
     # Different loss based on task type
-    if TASK_TYPE == "classification":
+    if TASK_TYPE_PRICE == "classification":
         loss_fn = nn.BCEWithLogitsLoss()
     else:
         loss_fn = nn.MSELoss()  # regression: predict continuous value (returns)
@@ -343,7 +343,7 @@ def train_one_model(
         with torch.no_grad():
             for p_b, n_b, t_b in test_loader:
                 logits = model(p_b.to(device), n_b.to(device)).squeeze()
-                if TASK_TYPE == "classification":
+                if TASK_TYPE_PRICE == "classification":
                     probs_list.extend(torch.sigmoid(logits).cpu().numpy())
                 else:
                     probs_list.extend(logits.cpu().numpy())  # regression: direct output
@@ -352,8 +352,8 @@ def train_one_model(
         probs = np.asarray(probs_list)
         y_true = np.asarray(y_list)
         
-        # Unified metrics based on TASK_TYPE
-        metrics = calculate_metrics(y_true, probs, task_type=TASK_TYPE, threshold=CLASSIFICATION_THRESHOLD)
+        # Unified metrics based on TASK_TYPE_PRICE
+        metrics = calculate_metrics(y_true, probs, task_type=TASK_TYPE_PRICE, threshold=CLASSIFICATION_THRESHOLD)
 
         it = epoch + 1
         
@@ -406,10 +406,10 @@ def save_best_model_bundle(
     ).to_csv(preds_path, index=False)
 
     meta = {
-        "task": f"price_direction_{TASK_TYPE}",
-        "task_type": TASK_TYPE,
+        "task": f"price_direction_{TASK_TYPE_PRICE}",
+        "task_type": TASK_TYPE_PRICE,
         "best_model_name": name,
-        "selection_metric": get_metrics_config(TASK_TYPE)['primary_metric'],
+        "selection_metric": get_metrics_config(TASK_TYPE_PRICE)['primary_metric'],
         "best_metrics": metrics,
         "feature_columns": feature_cols,
         "news_columns": news_cols,
@@ -484,8 +484,8 @@ if __name__ == "__main__":
             )
 
         # Select best model by primary metric
-        current_value = get_primary_metric_value(metrics, TASK_TYPE)
-        best_value = get_primary_metric_value(best["metrics"], TASK_TYPE) if best else float('-inf')
+        current_value = get_primary_metric_value(metrics, TASK_TYPE_PRICE)
+        best_value = get_primary_metric_value(best["metrics"], TASK_TYPE_PRICE) if best else float('-inf')
         
         if best is None or current_value > best_value:
             best = {
@@ -499,7 +499,7 @@ if __name__ == "__main__":
             }
 
     # All metrics as columns
-    primary_metric = get_metrics_config(TASK_TYPE)['primary_metric']
+    primary_metric = get_metrics_config(TASK_TYPE_PRICE)['primary_metric']
     comparison_df = (
         pd.DataFrame(
             [results[m]["metrics"] for m in results
@@ -517,7 +517,7 @@ if __name__ == "__main__":
     logger.report_table("model_comparison_table", "summary", comparison_df.round(4), 0)
     logger.upload_artifact("price_model_comparison_csv", comparison_path)
 
-    print(f"\nModel comparison (sorted by {get_metrics_config(TASK_TYPE)['primary_metric']}):")
+    print(f"\nModel comparison (sorted by {get_metrics_config(TASK_TYPE_PRICE)['primary_metric']}):")
     print(comparison_df.to_string(index=False))
     
     best_metrics_str = " | ".join([f"{k}={v:.4f}" for k, v in best["metrics"].items()])
