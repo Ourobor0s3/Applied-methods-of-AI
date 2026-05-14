@@ -1,90 +1,170 @@
 # Эксперименты: цена и волатильность
 
-Документ описывает, как устроены `analysis_script_price.py` и `analysis_script_volatility.py`, где править настройки и что попадает в ClearML.
+Документ описывает устройство `analysis_script_price.py` и `analysis_script_volatility.py`,
+где править настройки и какие артефакты попадают в ClearML / файловую систему.
 
-## Где что лежит
+---
+
+## Структура файлов
 
 | Файл | Назначение |
 |------|------------|
-| `src/cryptoforecast/experiment_config.py` | **Единая точка правки**: пути к CSV (`DATA_DIR`, `DATA_BTC_PATH`, …), даты, модели, обучение, ClearML, артефакты. |
-| `src/cryptoforecast/clearml_logger.py` | Обёртка над ClearML; при отключённом ClearML параметры из `create_logger(**kwargs)` всё равно доступны через `get_parameter`. |
-| `src/cryptoforecast/models_factory.py` | Создание моделей: `liquid`, `resnet`, `densenet`, `xgboost`. |
-| `src/cryptoforecast/nlp_features.py` | Эмбеддинги заголовков новостей и агрегация по дням. |
+| `src/cryptoforecast/experiment_config.py` | **Единая точка правки**: пути к CSV, даты, модели, гиперпараметры, ClearML, артефакты. |
+| `src/cryptoforecast/clearml_logger.py` | Обёртка над ClearML; при отключённом ClearML (`ENABLE_CLEARML=False`) параметры из `create_logger(**kwargs)` доступны через `get_parameter`. |
+| `src/cryptoforecast/models_factory.py` | Фабрика моделей: `liquid`, `resnet`, `densenet`, `xgboost`. |
+| `src/cryptoforecast/nlp_features.py` | Эмбеддинги заголовков новостей (Ollama / Sentence Transformers) и агрегация по дням. |
+| `src/cryptoforecast/utils.py` | Метрики (`calculate_metrics`, `should_stop_early`) + функции визуализации с поддержкой ClearML. |
 
-Запуск (из корня репозитория, с учётом `PYTHONPATH` к `src/cryptoforecast` или из этой папки):
+---
+
+## Запуск
 
 ```bash
-python analysis_script_price.py
-python analysis_script_volatility.py
+# Из корня репозитория (с OMP для стабильности XGBoost)
+$env:OMP_NUM_THREADS="4"; python src/cryptoforecast/analysis_script_volatility.py
+$env:OMP_NUM_THREADS="4"; python src/cryptoforecast/analysis_script_price.py
 ```
 
-## Поток данных (общий для обоих скриптов)
+---
 
-1. **Загрузка** — дневные свечи (`Open time`, OHLCV) и два потока новостей (bull/bear) с голосами.
-2. **Инженерия по свечам** — доходность, скользящая волатильность доходности, относительный диапазон дня, отношение объёма к скользящему среднему, MACD, RSI. Параметры окон заданы в `experiment_config.py` (`VOLATILITY_WINDOW` для таргета волатильности — отдельно; для price краткосрочная волатильность признака — `ROLLING_VOLATILITY_SHORT`).
-3. **Новости** — дневной сентимент (взвешенная сумма голосов), счётчик новостей; при `use_nlp=True` — NLP-агрегаты по дням (`nlp_features`).
-4. **Merge по календарной дате** — к свечам подмешивается дневная таблица новостей; пропуски по новостям заполняются нулями.
-5. **Таргет** — см. разделы ниже.
-6. **Разбиение** — `TimeSeriesSplit` с числом сплитов `time_series_cv_splits`; для обучения и отчёта берётся **последний** сплит (как и раньше): последний блок времени — валидация.
-7. **Датасет** — скользящее окно длины `sequence_length`: на вход подаётся последовательность дней; метка — на **последнем** шаге окна (класс или значение волатильности в лог-масштабе).
-8. **Скейлеры** — `RobustScaler` подгоняется на первых 80% строк **внутри** train- или test-части конкретного `DataFrame` после сплита (как в исходной реализации). Для волатильности таргет дополнительно масштабируется для обучения PyTorch; метрики на валидации для PyTorch считаются в **исходной шкале таргета** (`targets_raw`), для XGBoost — на сыром таргете из плоских признаков.
+## Поток данных (общий)
 
-## Скрипт цены (`analysis_script_price.py`)
+1. **Загрузка CSV** — OHLCV 15-минутные свечи + новости bull/bear с голосами
+2. **Ценовые признаки** — returns, rolling volatility, volume_ratio, price_range, MACD, RSI
+3. **Новостные признаки** — sentiment_score (weighted sum голосов), news_count;
+   при `USE_NLP=True` — PCA-эмбеддинги заголовков через Ollama (`qwen3-embedding:0.6b`)
+4. **Merge по дате** — дневная агрегация новостей присоединяется к свечам; пропуски = 0
+5. **Таргет** — определяется скриптом (см. ниже)
+6. **TimeSeriesSplit** (`time_series_cv_splits=3`) — последний сплит используется как train/test
+7. **Dataset** — скользящее окно `sequence_length=25`; метка на последнем шаге
+8. **Скейлеры** — `RobustScaler` fit на первых 80% train-части (утечка исключена)
 
-**Задача:** бинарная классификация — вырастет ли цена закрытия через `forecast_horizon` дней относительно текущего закрытия.
-
-- **Модели PyTorch:** `BCEWithLogitsLoss`, на валидации вероятность — `sigmoid(logits)`, порог `classification_threshold` из конфига.
-- **XGBoost:** признаки — конкатенация развёрнутых во времени ценовых и новостных каналов; предсказания клипуются в \([0, 1]\) для метрик в том же формате, что и вероятности.
-
-**Метрики:** `accuracy`, `roc_auc` (AUC в скрипте защищён от одного класса на валидации).
-
-**Выбор лучшей модели:** максимум `roc_auc` (ключ `selection_metric` в метаданных).
-
-**Артефакты** (каталог `artifacts_dir`): `best_price_model_meta.json`, веса/модель, скейлеры, CSV предсказаний. В метаданных поля переименованы в единый стиль: `feature_columns`, `news_columns`, `nlp_columns`, `best_model_name`.
+---
 
 ## Скрипт волатильности (`analysis_script_volatility.py`)
 
-**Задача:** регрессия `target_volatility_log = log1p(|rolling_std(future_returns)| * 100)` — сглаженная будущая волатильность доходности в лог-масштабе.
+**Задача:** регрессия — предсказать `target_volatility_log = log1p(|future_volatility| * 100)`
+(лог-масштаб будущей волатильности доходности).
 
-- **PyTorch:** `HuberLoss` по **масштабированному** таргету; на валидации сравнение предсказаний с **сырым** `target_volatility_log` (как в исходном коде: сеть учится в scaled space, метрики — в исходных единицах таргета).
-- **XGBoost:** обучение на сыром таргете из плоских признаков.
+**Метрики:** `rmse`, `r2`, `mae` — выбор лучшей модели по `r2` (выше = лучше).
 
-**Метрики:** `mae`, `rmse`, `r2`.
+**PyTorch:** `HuberLoss` (устойчив к выбросам) на масштабированном таргете;
+метрики считаются на сыром таргете (`targets_raw`).
 
-**Выбор лучшей модели:** максимум `r2`.
+**XGBoost:** обучение на сыром таргете из flatten-признаков;
+early stopping через `eval_set`.
 
-**Артефакты:** аналогично price, префикс `best_volatility_*`.
+**Логируемые графики (ClearML + файл):**
+- Кривые обучения (`Training/Loss` → `{model_name}`)
+- Bar chart сравнения моделей (`Model Comparison` → `r2`)
+- Scatter: предсказания vs реальность (`Predictions` → `{best_model}`)
+- Распределение предсказаний (`Prediction Distribution` → `{best_model}`)
+- Важность признаков — XGBoost (`Feature Importance` → `{best_model}`)
 
-## Имена параметров и ClearML
+**Результат (14.05.2026, все 4 модели):**
+- ✅ xgboost: **R²=0.5942** — лучшая модель
+- ❌ liquid: R²=-31.49 (переобучение, ранняя остановка ep 8)
+- ❌ resnet: R²=-34.38 (переобучение, ранняя остановка ep 8)
+- ❌ densenet: R²=-47.67 (переобучение, ранняя остановка ep 8)
 
-При инициализации логгера в ClearML уходят параметры из `clearml_base_parameters()` в `experiment_config.py`:
+---
 
-- `models_to_test`, `use_nlp`, `nlp_sentence_model_name`
-- `data_start_date`, `data_end_date`, `forecast_horizon`, `volatility_window`
-- `sequence_length`, `time_series_cv_splits`, `training_epochs`, `batch_size`, `learning_rate`, `weight_decay`
-- `hidden_dim_default`, `hidden_dim_liquid`, `huber_loss_delta`, `artifacts_dir`
+## Скрипт цены (`analysis_script_price.py`)
 
-Дополнительно подключаются конфиги с именами:
+**Задача:** бинарная классификация — вырастет ли цена через `forecast_horizon` периодов.
 
-- `run` — фактический список `models_to_test` на запуск
-- `data` — параметры загрузки/таргета для конкретного скрипта
-- `training_<model_name>` — гиперпараметры одного прогона
+**Метрики:** `roc_auc`, `accuracy` — выбор по `roc_auc` (выше = лучше).
 
-**Заголовки (title) скаляров** унифицированы:
+**PyTorch:** `BCEWithLogitsLoss` → sigmoid на валидации.
 
-| Title | Содержание |
-|-------|------------|
-| `dataset` | `sample_count`, `nlp_feature_count`, для price ещё `positive_class_ratio_pct` |
-| `metrics_epoch` | по эпохам: `<model>.accuracy`, `<model>.roc_auc` (price) или `<model>.mae`, `.rmse`, `.r2` (volatility) |
-| `metrics_final` | итог по модели после цикла обучения |
-| `model` | `<model>.parameter_count` |
-| `model_comparison` | серии вида `roc_auc.<model>`, `accuracy.<model>` или `r2.<model>`, `mae.<model>`, `rmse.<model>` (функция `comparison_scalar_series`) |
-| `model_comparison_table` | таблица со сводкой по всем моделям |
+**XGBoost:** предсказания клипируются в [0, 1], метрики считаются аналогично.
 
-Так проще искать одни и те же метрики в UI ClearML для разных экспериментов.
+**Логируемые графики (ClearML + файл):**
+- Кривые обучения (`Training/Loss` → `{model_name}`)
+- Bar chart сравнения моделей (`Model Comparison` → `roc_auc`)
+- Scatter предсказаний (`Predictions` → `{best_model}`)
+- Распределение вероятностей (`Prediction Distribution` → `{best_model}`)
+- ROC AUC кривая (`ROC Curve` → `{best_model}`)
+- Матрица ошибок (`Confusion Matrix` → `{best_model}`)
 
-## Практические замечания
+**Результат (14.05.2026, все 4 модели):**
+- ✅ liquid: **ROC=0.5314**, ACC=0.5220 — лучшая модель
+- ⚠️ densenet: ROC=0.5266 (на уровне случайного)
+- ❌ resnet: ROC=0.5148 (около случайного)
+- ❌ xgboost: ROC=0.5141 (около случайного)
 
-- Порог классификации, имена файлов данных и пути артефактов меняются в `experiment_config.py`.
-- Если меняется список NLP-колонок, переобучите модель и обновите артефакты — в `meta.json` сохраняется полный список `nlp_columns`.
-- Старые `meta.json` с ключами `feature_cols` / `best_model_type` отличаются от новых имён; для инференса ориентируйтесь на актуальный формат из свежего прогона.
+---
+
+## Артефакты (директория `artifacts/`)
+
+### Волатильность
+```
+best_volatility_xgboost_model.joblib   — лучшая модель (XGBoost)
+best_volatility_scalers.joblib          — RobustScaler (price, news, target)
+best_volatility_predictions.csv         — предсказания vs реальные значения
+best_volatility_model_meta.json         — конфиг, метрики, пути
+best_volatility_prediction_scatter.png   — scatter + residuals
+best_volatility_prediction_distribution.png — гистограммы / линейный график
+best_volatility_feature_importance.png   — топ-20 признаков (XGBoost)
+volatility_model_comparison.png          — bar chart R² по моделям
+{liquid|densenet|resnet}_training_losses.png — кривые обучения
+```
+
+### Цена
+```
+best_price_torch_model.pt               — лучшая модель (PyTorch: liquid)
+best_price_scalers.joblib                — RobustScaler (price, news)
+best_price_predictions.csv              — предсказания вероятностей
+best_price_model_meta.json              — конфиг, метрики, пути
+best_price_prediction_scatter.png       — scatter предсказаний
+best_price_prediction_distribution.png  — распределение вероятностей
+best_price_roc_curve.png               — ROC AUC кривая
+best_price_confusion_matrix.png         — матрица ошибок
+price_model_comparison.png             — bar chart ROC AUC по моделям
+{liquid|densenet|resnet}_training_losses.png — кривые обучения
+```
+
+---
+
+## ClearML: что логируется
+
+| Что | Как | Когда |
+|-----|-----|-------|
+| Параметры конфигурации | `logger.connect_configuration()` | До загрузки данных |
+| Число параметров модели | `logger.report_scalar("model", "{model}.param_count", ...)` | До начала обучения |
+| Train/Val loss по эпохам | `logger.report_scalar("Training/Loss", "{model}.train_loss", ...)` | Каждую эпоху |
+| Метрики моделей (скаляр) | `logger.report_scalar("model_comparison", ...)` | После обучения каждой модели |
+| Таблица сравнения | `logger.report_table("model_comparison_table", ...)` | После цикла |
+| Графики matplotlib | `logger.report_matplotlib_figure(...)` | После цикла (через `utils.plot_*`) |
+| Артефакты (файлы) | `logger.upload_artifact(...)` | После сохранения модели |
+| Текстовые логи | `logger.report_text(...)` | Ключевые события |
+
+---
+
+## Конфигурация запуска (`experiment_config.py`)
+
+Ключевые параметры, влияющие на результат:
+
+| Параметр | Влияние |
+|----------|---------|
+| `MODELS_TO_TEST` | Какие модели обучаются |
+| `TASK_TYPE_PRICE` / `TASK_TYPE_VOLATILITY` | Тип задачи (classification / regression) |
+| `DATA_START_DATE` / `DATA_END_DATE` | Период данных |
+| `SEQUENCE_LENGTH=25` | Длина скользящего окна |
+| `TRAINING_EPOCHS=30` | Макс. число эпох |
+| `EARLY_STOPPING_PATIENCE=7` | Early stopping threshold |
+| `LEARNING_RATE=0.0005` | Скорость обучения |
+| `USE_NLP=False` | Включить NLP-эмбеддинги (нужен Ollama) |
+| `ENABLE_CLEARML` | Вкл/выкл логирование в ClearML |
+
+---
+
+## Быстрая проверка работоспособности
+
+```bash
+$env:OMP_NUM_THREADS="4"; python src/cryptoforecast/analysis_script_volatility.py
+# Должно напечатать: ClearML enabled=True | models_to_test=[...]
+# Завершиться строками: Best model: xgboost | R2=0.XXXX
+```
+
+Если ClearML не инициализирован — измените `ENABLE_CLEARML = False` в `experiment_config.py`.

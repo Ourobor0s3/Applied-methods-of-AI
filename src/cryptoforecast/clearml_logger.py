@@ -6,9 +6,8 @@ clearml_logger.py
 
 from typing import Optional
 import pandas as pd
+from experiment_config import ENABLE_CLEARML
 
-# Флаг включения ClearML
-ENABLE_CLEARML = True  # ← измените на False для отключения
 
 class ClearMLLogger:
     """

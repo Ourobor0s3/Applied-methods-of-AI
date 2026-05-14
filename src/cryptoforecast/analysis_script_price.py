@@ -1,6 +1,17 @@
 """
-Сравнение моделей на задаче направления цены (классификация: рост через horizon).
-Конфигурация и пути к данным: experiment_config.py.
+================================================================================
+  Скрипт обучения: прогнозирование направления цены BTC (классификация)
+================================================================================
+  Задача: бинарная классификация — растёт ли цена через horizon периодов?
+  Таргет: 1 если future_close > close, иначе 0
+
+  Данные: OHLCV 15-минутные свечи + новости bull/bear
+  Период: DATA_START_DATE .. DATA_END_DATE (experiment_config.py)
+  Модели: liquid, densenet, resnet, xgboost
+
+  Конфигурация запуска: MODELS_TO_TEST, TASK_TYPE_PRICE, TRAINING_EPOCHS и пр.
+  Все параметры — в experiment_config.py (единый источник правды).
+================================================================================
 """
 
 from __future__ import annotations
@@ -8,6 +19,7 @@ from __future__ import annotations
 import json
 import os
 import warnings
+from typing import Dict, List, Tuple
 
 import joblib
 import numpy as np
@@ -33,6 +45,7 @@ from experiment_config import (
     CLEARML_TITLE_METRICS_EPOCH,
     CLEARML_TITLE_METRICS_FINAL,
     CLEARML_TITLE_MODEL,
+    CLEARML_TITLE_TRAINING_LOSS,
     DATA_BEAR_PATH,
     DATA_BTC_DAY_PATH,
     DATA_BULL_PATH,
@@ -44,27 +57,42 @@ from experiment_config import (
     HIDDEN_DIM_DEFAULT,
     HIDDEN_DIM_LIQUID,
     CLASSIFICATION_THRESHOLD,
+    ROLLING_VOLATILITY_SHORT,
     TASK_TYPE_PRICE,
     LEARNING_RATE,
     MODELS_TO_TEST,
     NLP_SENTENCE_MODEL_NAME,
     NLP_MAX_EMBEDDING_DIM,
-    ROLLING_VOLATILITY_SHORT,
     RSI_WINDOW,
     SEQUENCE_LENGTH,
     TIME_SERIES_CV_SPLITS,
     TRAINING_EPOCHS,
     USE_NLP,
+    VOLATILITY_WINDOW,
     VOLUME_MA_WINDOW,
     WEIGHT_DECAY,
     XGBOOST_FLATTEN_BATCH_SIZE,
+    EARLY_STOPPING_PATIENCE,
+    EARLY_STOPPING_DELTA,
+    GRADIENT_CLIP_VALUE,
     clearml_base_parameters,
     comparison_scalar_series,
     training_config_dict,
 )
 from models_factory import create_model
 from nlp_features import NewsTitleEncoder, aggregate_news_embeddings_with_votes
-from unified_metrics import calculate_metrics, get_metrics_config, get_primary_metric_value
+from utils import (
+    should_stop_early,
+    plot_training_losses,
+    plot_prediction_scatter,
+    plot_model_comparison,
+    plot_prediction_distribution,
+    plot_roc_curve,
+    plot_confusion_matrix,
+    calculate_metrics,
+    get_primary_metric_value,
+    get_metrics_config,
+)
 
 warnings.filterwarnings("ignore")
 
@@ -77,31 +105,42 @@ logger = create_logger(
 )
 
 
-def load_and_prepare_data(
-    candles_path,
-    bull_path,
-    bear_path,
-    start_date=DATA_START_DATE,
-    end_date=DATA_END_DATE,
-    forecast_horizon=FORECAST_HORIZON,
-    use_nlp=USE_NLP,
-):
-    """Свечи + дневные новости (сентимент, опционально NLP-эмбеддинги), таргет — знак будущей доходности."""
+# =============================================================================
+#  Загрузка и подготовка данных
+# =============================================================================
+
+def load_and_prepare_data(candles_path, bull_path, bear_path,
+                            start_date=DATA_START_DATE, end_date=DATA_END_DATE,
+                            forecast_horizon=FORECAST_HORIZON, use_nlp=USE_NLP):
+    """Загружает свечи и новости, создаёт признаки и таргет.
+
+    Признаки (ценовые):
+      - returns: дневная доходность
+      - volatility: скользящее стандартное отклонение доходности (ROLLING_VOLATILITY_SHORT)
+      - volume_ratio: объём / скользящее среднее объёма
+      - price_range: (High - Low) / Close
+      - macd: EMA(12) - EMA(26)
+      - rsi: Relative Strength Index
+
+    Признаки (новостные):
+      - sentiment_sum / sentiment_mean / sentiment_std: взвешенный сентимент по голосам
+      - news_count: количество новостей за день
+
+    Таргет: 1 если Close через forecast_horizon выше текущего, иначе 0.
+    """
     logger.connect_configuration(
-        {
-            "start_date": start_date,
-            "end_date": end_date,
-            "forecast_horizon": forecast_horizon,
-            "use_nlp": use_nlp,
-            "nlp_sentence_model_name": NLP_SENTENCE_MODEL_NAME,
-        },
+        {"start_date": start_date, "end_date": end_date,
+         "forecast_horizon": forecast_horizon, "use_nlp": use_nlp,
+         "nlp_sentence_model_name": NLP_SENTENCE_MODEL_NAME},
         name=CLEARML_CONFIG_DATA,
     )
 
+    # Загрузка данных
     candles = pd.read_csv(candles_path, parse_dates=["Open time"])
     bull = pd.read_csv(bull_path, parse_dates=["datetime"])
     bear = pd.read_csv(bear_path, parse_dates=["datetime"])
 
+    # Bulls: нет negative_votes, Bears: нет positive_votes
     for news_df in (bull, bear):
         for col in ("positive_votes", "negative_votes", "important_votes"):
             if col not in news_df.columns:
@@ -110,9 +149,11 @@ def load_and_prepare_data(
     bear["positive_votes"] = 0
     all_news = pd.concat([bull, bear], ignore_index=True)
 
+    # Фильтрация по дате
     candles = candles[(candles["Open time"] >= start_date) & (candles["Open time"] <= end_date)].copy()
     all_news = all_news[(all_news["datetime"] >= start_date) & (all_news["datetime"] <= end_date)].copy()
 
+    # Ценовые признаки
     candles["returns"] = candles["Close"].pct_change()
     candles["volatility"] = candles["returns"].rolling(ROLLING_VOLATILITY_SHORT).std()
     candles["price_range"] = (candles["High"] - candles["Low"]) / candles["Close"]
@@ -122,22 +163,25 @@ def load_and_prepare_data(
     candles["ema_26"] = candles["Close"].ewm(span=EMA_SLOW, adjust=False).mean()
     candles["macd"] = candles["ema_12"] - candles["ema_26"]
 
+    # RSI
     delta = candles["Close"].diff()
     gain = delta.where(delta > 0, 0).rolling(RSI_WINDOW).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(RSI_WINDOW).mean()
     candles["rsi"] = 100 - (100 / (1 + loss.replace(0, np.nan)))
 
+    # Сентимент новостей: weighted sum по типам голосов
     all_news["sentiment_score"] = (
         all_news["positive_votes"] * 1.0
         + all_news["important_votes"] * 0.5
         - all_news["negative_votes"] * 0.8
     )
-    all_news["sentiment_abs"] = all_news["sentiment_score"].abs()
 
+    # NLP-эмбеддинги (если включено)
     nlp_cols: list[str] = []
     if use_nlp:
         encoder = NewsTitleEncoder(model_name=NLP_SENTENCE_MODEL_NAME)
-        news_with_emb = aggregate_news_embeddings_with_votes(all_news, encoder, max_emb_dim=NLP_MAX_EMBEDDING_DIM)
+        news_with_emb = aggregate_news_embeddings_with_votes(all_news, encoder,
+                                                             max_emb_dim=NLP_MAX_EMBEDDING_DIM)
         news_agg = (
             all_news.groupby(all_news["datetime"].dt.date)
             .agg({"sentiment_score": ["sum", "mean", "std"], "title": "count"})
@@ -157,27 +201,29 @@ def load_and_prepare_data(
         news_daily.columns = ["date", "sentiment_sum", "sentiment_mean", "sentiment_std", "news_count"]
         news_daily["date"] = pd.to_datetime(news_daily["date"])
 
+    # Объединение свечей с новостями
     candles["date"] = pd.to_datetime(candles["Open time"].dt.date)
     df = candles.merge(news_daily, on="date", how="left")
 
+    # Заполняем пропуски нулями (дни без новостей)
     news_cols = ["sentiment_sum", "sentiment_mean", "sentiment_std", "news_count"]
     for col in news_cols + nlp_cols:
         df[col] = df[col].fillna(0)
 
+    # Таргет: направление цены через forecast_horizon свечей
     df["future_close"] = df["Close"].shift(-forecast_horizon)
-    df["returns_future"] = (df["future_close"] - df["Close"]) / df["Close"]  # процент изменения
-    
-    # Regression: предсказываем процент изменения (-1 to 1 примерно)
-    # Classification: предсказываем 1 если рост, 0 если падение
+    df["returns_future"] = (df["future_close"] - df["Close"]) / df["Close"]
+
     if TASK_TYPE_PRICE == "classification":
         df["target"] = (df["future_close"] > df["Close"]).astype(int)
     else:
-        # Regression: используем процент изменения как таргет
-        df["target"] = df["returns_future"].clip(-1, 1)  # ограничим выбросы
+        df["target"] = df["returns_future"].clip(-1, 1)
 
+    # Отбрасываем строки с NaN в признаках или без future_close
     feature_cols = ["returns", "volatility", "volume_ratio", "price_range", "macd", "rsi"]
     df = df.dropna(subset=feature_cols + news_cols + nlp_cols + ["future_close"]).reset_index(drop=True)
 
+    # Логируем статистику датасета в ClearML
     if TASK_TYPE_PRICE == "classification":
         positive_ratio_pct = float(df["target"].mean() * 100)
         logger.report_scalar(CLEARML_TITLE_DATASET, "sample_count", float(len(df)), 0)
@@ -186,27 +232,30 @@ def load_and_prepare_data(
         logger.report_scalar(CLEARML_TITLE_DATASET, "sample_count", float(len(df)), 0)
         logger.report_scalar(CLEARML_TITLE_DATASET, "target_mean", float(df["target"].mean()), 0)
         logger.report_scalar(CLEARML_TITLE_DATASET, "target_std", float(df["target"].std()), 0)
-    
+
     logger.report_scalar(CLEARML_TITLE_DATASET, "nlp_feature_count", float(len(nlp_cols)), 0)
 
     return df, feature_cols, news_cols, nlp_cols
 
 
 class PriceSequenceDataset(Dataset):
-    """Последовательности ценовых и новостных признаков; скейлеры fit на первых 80% строк split-а."""
+    """PyTorch Dataset для последовательностей фиксированной длины (sequence_length).
+    Каждый элемент: (ценовые_признаки[seq_len, n_feat],
+                     новостные_признаки[seq_len, n_news],
+                     таргет_на_последнем_шаге)
 
-    def __init__(
-        self,
-        df: pd.DataFrame,
-        sequence_length: int,
-        target_col: str = "target",
-        feature_cols: list[str] | None = None,
-        news_cols: list[str] | None = None,
-        nlp_cols: list[str] | None = None,
-    ):
+    RobustScaler fit на первых 80% train-части — валидация не должна "видеть"
+    тестовые данные через скейлеры (предотвращает leakage).
+    """
+
+    def __init__(self, df: pd.DataFrame, sequence_length: int,
+                 target_col: str = "target",
+                 feature_cols: list = None, news_cols: list = None, nlp_cols: list = None):
         self.sequence_length = sequence_length
-        feature_cols = feature_cols or ["returns", "volatility", "volume_ratio", "price_range", "macd", "rsi"]
-        news_cols = news_cols or ["sentiment_sum", "sentiment_mean", "sentiment_std", "news_count"]
+        feature_cols = feature_cols or ["returns", "volatility", "volume_ratio",
+                                         "price_range", "macd", "rsi"]
+        news_cols = news_cols or ["sentiment_sum", "sentiment_mean",
+                                    "sentiment_std", "news_count"]
         nlp_cols = nlp_cols or []
 
         self.scaler_price = RobustScaler()
@@ -215,12 +264,15 @@ class PriceSequenceDataset(Dataset):
         price_data = df[feature_cols].values
         news_block = df[news_cols + nlp_cols].values if nlp_cols else df[news_cols].values
 
+        # Fit скейлеров только на train-части (первые 80%)
         split_idx = max(1, int(len(df) * 0.8))
         self.scaler_price.fit(price_data[:split_idx])
         self.scaler_news.fit(news_block[:split_idx])
 
-        self.price_data = torch.tensor(self.scaler_price.transform(price_data), dtype=torch.float32)
-        self.news_data = torch.tensor(self.scaler_news.transform(news_block), dtype=torch.float32)
+        self.price_data = torch.tensor(self.scaler_price.transform(price_data),
+                                       dtype=torch.float32)
+        self.news_data = torch.tensor(self.scaler_news.transform(news_block),
+                                      dtype=torch.float32)
         self.targets = torch.tensor(df[target_col].values, dtype=torch.float32)
 
     def __len__(self) -> int:
@@ -231,163 +283,187 @@ class PriceSequenceDataset(Dataset):
         return self.price_data[idx:end], self.news_data[idx:end], self.targets[end - 1]
 
 
-def train_one_model(
-    df: pd.DataFrame,
-    model_name: str,
-    feature_cols: list[str],
-    news_cols: list[str],
-    nlp_cols: list[str],
-    *,
-    training_epochs: int,
-    batch_size: int,
-    learning_rate: float,
-    sequence_length: int,
-):
-    logger.connect_configuration(training_config_dict(model_name), name=f"{CLEARML_CONFIG_TRAINING_PREFIX}_{model_name}")
+def _flatten(ds):
+    """Превращает PyTorch Dataset в плоские массивы (X, y) для XGBoost."""
+    loader = DataLoader(ds, batch_size=XGBOOST_FLATTEN_BATCH_SIZE, shuffle=False)
+    xs, ys = [], []
+    for p_b, n_b, t_b in loader:
+        xs.append(np.hstack([
+            p_b.numpy().reshape(p_b.shape[0], -1),
+            n_b.numpy().reshape(n_b.shape[0], -1)
+        ]))
+        ys.append(t_b.numpy())
+    return np.vstack(xs), np.concatenate(ys)
 
+
+def train_one_model(df: pd.DataFrame, model_name: str,
+                    feature_cols: list, news_cols: list, nlp_cols: list,
+                    *, training_epochs: int, batch_size: int,
+                    learning_rate: float, sequence_length: int):
+    """Обучает одну модель на данных df.
+
+    Для нейросетей (liquid, resnet, densenet):
+      - AdamW + CosineAnnealingLR
+      - BCEWithLogitsLoss (классификация) или MSELoss (регрессия)
+      - Gradient clipping + early stopping
+      - Логирует loss и метрики в ClearML каждую эпоху
+
+    Для XGBoost:
+      - Flatten данных (последовательность -> вектор)
+      - Early stopping через eval_set
+      - Возвращает метрики сразу (без цикла эпох)
+    """
+    logger.connect_configuration(
+        training_config_dict(model_name),
+        name=f"{CLEARML_CONFIG_TRAINING_PREFIX}_{model_name}"
+    )
+
+    # TimeSeriesSplit: используем последний сплит как train/test
     tscv = TimeSeriesSplit(n_splits=TIME_SERIES_CV_SPLITS)
     train_idx, test_idx = list(tscv.split(df))[-1]
     train_df = df.iloc[train_idx].reset_index(drop=True)
     test_df = df.iloc[test_idx].reset_index(drop=True)
 
-    train_ds = PriceSequenceDataset(
-        train_df,
-        sequence_length,
-        feature_cols=feature_cols,
-        news_cols=news_cols,
-        nlp_cols=nlp_cols,
-    )
-    test_ds = PriceSequenceDataset(
-        test_df,
-        sequence_length,
-        feature_cols=feature_cols,
-        news_cols=news_cols,
-        nlp_cols=nlp_cols,
-    )
+    train_ds = PriceSequenceDataset(train_df, sequence_length,
+                                     feature_cols=feature_cols,
+                                     news_cols=news_cols, nlp_cols=nlp_cols)
+    test_ds = PriceSequenceDataset(test_df, sequence_length,
+                                    feature_cols=feature_cols,
+                                    news_cols=news_cols, nlp_cols=nlp_cols)
 
+    # XGBoost: flatten + обучение
     if model_name == "xgboost":
-
-        def flatten_dataset(ds: PriceSequenceDataset):
-            loader = DataLoader(ds, batch_size=XGBOOST_FLATTEN_BATCH_SIZE, shuffle=False)
-            xs, ys = [], []
-            for p_b, n_b, t_b in loader:
-                xs.append(np.hstack([p_b.numpy().reshape(p_b.shape[0], -1), n_b.numpy().reshape(n_b.shape[0], -1)]))
-                ys.append(t_b.numpy())
-            return np.vstack(xs), np.concatenate(ys)
-
-        x_train, y_train = flatten_dataset(train_ds)
-        x_val, y_val = flatten_dataset(test_ds)
-
+        x_train, y_train = _flatten(train_ds)
+        x_val, y_val = _flatten(test_ds)
         model = create_model("xgboost", num_features=x_train.shape[1], news_dim=0)
-        feat_names = [f"feature_{i}" for i in range(x_train.shape[1])]
-        model.fit(x_train, y_train, x_val, y_val, feature_names=feat_names)
+        model.fit(x_train, y_train, x_val, y_val,
+                  feature_names=[f"f{i}" for i in range(x_train.shape[1])])
+        probs = np.clip(model.predict(x_val), 0, 1) \
+            if TASK_TYPE_PRICE == "classification" else model.predict(x_val)
+        metrics = calculate_metrics(y_val, probs, TASK_TYPE_PRICE)
+        print(f"price | {model_name} | ROC={metrics['roc_auc']:.4f} ACC={metrics['accuracy']:.4f}")
+        return model, probs, y_val, metrics, train_ds, [], []
 
-        raw = model.predict(x_val)
-        
-        # For classification: clip to 0-1 (probability), for regression: use raw values
-        if TASK_TYPE_PRICE == "classification":
-            probs = np.clip(raw, 0.0, 1.0)
-        else:
-            probs = raw  # regression: keep continuous values (returns)
-        
-        y_true = y_val
-        
-        # Unified metrics based on TASK_TYPE_PRICE
-        metrics = calculate_metrics(y_true, probs, TASK_TYPE_PRICE=TASK_TYPE_PRICE, threshold=CLASSIFICATION_THRESHOLD)
-        
-        # Dynamic logging of all metrics
-        for metric_name, value in metrics.items():
-            logger.report_scalar(CLEARML_TITLE_METRICS_FINAL, f"{model_name}.{metric_name}", value, 0)
-        
-        # Print all metrics
-        metrics_str = " | ".join([f"{k}={v:.4f}" for k, v in metrics.items()])
-        print(f"price | model={model_name} | {metrics_str}")
-        
-        return model, probs, y_true, metrics, train_ds
-
+    # Нейросети: PyTorch training loop
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     hidden = HIDDEN_DIM_LIQUID if model_name == "liquid" else HIDDEN_DIM_DEFAULT
     model = create_model(
-        model_name,
-        num_features=len(feature_cols),
-        news_dim=len(news_cols) + len(nlp_cols),
-        hidden_dim=hidden,
+        model_name, num_features=len(feature_cols),
+        news_dim=len(news_cols) + len(nlp_cols), hidden_dim=hidden
     ).to(device)
 
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
     test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False)
+    enable_clearml = logger._ENABLE_CLEARML if hasattr(logger, "_ENABLE_CLEARML") else True
+
+    # Функция потерь зависит от типа задачи
+    loss_fn = nn.BCEWithLogitsLoss() if TASK_TYPE_PRICE == "classification" else nn.MSELoss()
 
     opt = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=WEIGHT_DECAY)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=training_epochs)
-    
-    # Different loss based on task type
-    if TASK_TYPE_PRICE == "classification":
-        loss_fn = nn.BCEWithLogitsLoss()
-    else:
-        loss_fn = nn.MSELoss()  # regression: predict continuous value (returns)
 
-    param_count = sum(p.numel() for p in model.parameters())
-    logger.report_scalar(CLEARML_TITLE_MODEL, f"{model_name}.parameter_count", float(param_count), 0)
+    train_losses, val_losses, best_val_loss, best_model_state = [], [], float("inf"), None
+
+    # Логируем число параметров модели
+    logger.report_scalar(CLEARML_TITLE_MODEL, f"{model_name}.param_count",
+                        sum(p.numel() for p in model.parameters()), 0)
 
     for epoch in range(training_epochs):
+        # --- Train ---
         model.train()
+        train_loss_list = []
         for p_b, n_b, t_b in train_loader:
             opt.zero_grad()
-            logits = model(p_b.to(device), n_b.to(device)).squeeze()
-            loss_fn(logits, t_b.to(device)).backward()
+            loss = loss_fn(model(p_b.to(device), n_b.to(device)).squeeze(), t_b.to(device))
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), GRADIENT_CLIP_VALUE)
             opt.step()
+            train_loss_list.append(loss.item())
+
         sched.step()
 
+        # --- Validation ---
         model.eval()
-        probs_list, y_list = [], []
+        loss_list, probs_list, y_list = [], [], []
+
         with torch.no_grad():
             for p_b, n_b, t_b in test_loader:
-                logits = model(p_b.to(device), n_b.to(device)).squeeze()
-                if TASK_TYPE_PRICE == "classification":
-                    probs_list.extend(torch.sigmoid(logits).cpu().numpy())
-                else:
-                    probs_list.extend(logits.cpu().numpy())  # regression: direct output
+                out = model(p_b.to(device), n_b.to(device)).squeeze()
+                loss_list.append(loss_fn(out, t_b.to(device)).item())
+                probs_list.extend(
+                    torch.sigmoid(out).cpu().numpy()
+                    if TASK_TYPE_PRICE == "classification" else out.cpu().numpy()
+                )
                 y_list.extend(t_b.numpy())
 
-        probs = np.asarray(probs_list)
-        y_true = np.asarray(y_list)
-        
-        # Unified metrics based on TASK_TYPE_PRICE
-        metrics = calculate_metrics(y_true, probs, task_type=TASK_TYPE_PRICE, threshold=CLASSIFICATION_THRESHOLD)
+        t_loss, v_loss = np.mean(train_loss_list), np.mean(loss_list)
+        train_losses.append(t_loss)
+        val_losses.append(v_loss)
 
-        it = epoch + 1
-        
-        # Dynamic logging of all metrics
-        for metric_name, value in metrics.items():
-            logger.report_scalar(CLEARML_TITLE_METRICS_EPOCH, f"{model_name}.{metric_name}", value, it)
+        # Логируем loss в ClearML
+        if enable_clearml:
+            logger.report_scalar(CLEARML_TITLE_TRAINING_LOSS,
+                                 f"{model_name}.train_loss", t_loss, epoch + 1)
+            logger.report_scalar(CLEARML_TITLE_TRAINING_LOSS,
+                                 f"{model_name}.val_loss", v_loss, epoch + 1)
 
-        # Print all metrics every 10 epochs
-        if epoch % 10 == 0:
-            metrics_str = " | ".join([f"{k}={v:.4f}" for k, v in metrics.items()])
-            print(f"price | model={model_name} | epoch={it} | {metrics_str}")
+        # Проверка ранней остановки
+        should_stop, _ = should_stop_early(train_losses, val_losses,
+                                           EARLY_STOPPING_PATIENCE, EARLY_STOPPING_DELTA)
+        if should_stop:
+            print(f"Ранняя остановка на эпохе {epoch + 1}")
+            if best_model_state:
+                model.load_state_dict(best_model_state)
+            break
 
-    # Final logging
-    for metric_name, value in metrics.items():
-        logger.report_scalar(CLEARML_TITLE_METRICS_FINAL, f"{model_name}.{metric_name}", value, 0)
-    
-    return model, probs, y_true, metrics, train_ds
+        # Запоминаем лучшее состояние модели
+        if v_loss < best_val_loss:
+            best_val_loss, best_model_state = v_loss, \
+                {k: v.cpu().clone() for k, v in model.state_dict().items()}
+
+        # Печать метрик (для отслеживания в консоли)
+        metrics = calculate_metrics(np.asarray(y_list), np.asarray(probs_list), TASK_TYPE_PRICE)
+        print(f"price | {model_name} | ep={epoch+1:3d} | "
+              f"loss={t_loss:.4f}/{v_loss:.4f} | "
+              f"ROC={metrics['roc_auc']:.4f} ACC={metrics['accuracy']:.4f}")
+
+    # Сохраняем лучшее состояние и массивы потерь
+    if best_model_state:
+        model.load_state_dict(best_model_state)
+        torch.save(best_model_state, f"{ARTIFACTS_DIR}/{model_name}_best_final.pt")
+
+    np.save(f"{ARTIFACTS_DIR}/{model_name}_train_losses.npy", train_losses)
+    np.save(f"{ARTIFACTS_DIR}/{model_name}_val_losses.npy", val_losses)
+
+    # Графики обучения — только если ClearML выключен
+    # (если включен — графики загружаются после цикла в main)
+    if not enable_clearml:
+        plot_training_losses(train_losses, val_losses, model_name,
+                             f"{ARTIFACTS_DIR}/{model_name}_training_losses.png")
+
+    return model, np.asarray(probs_list), np.asarray(y_list), metrics, \
+        train_ds, train_losses, val_losses
 
 
-def save_best_model_bundle(
-    best: dict,
-    feature_cols: list[str],
-    news_cols: list[str],
-    nlp_cols: list[str],
-    output_dir: str = ARTIFACTS_DIR,
-):
+# =============================================================================
+#  Сохранение лучшей модели
+# =============================================================================
+
+def save_best_model_bundle(best: dict, feature_cols: list, news_cols: list, nlp_cols: list,
+                            output_dir: str = ARTIFACTS_DIR):
+    """Сохраняет артефакты лучшей модели: скейлеры, веса, предсказания, метаданные.
+    Все файлы загружаются в ClearML как артефакты."""
     os.makedirs(output_dir, exist_ok=True)
     name = best["model_name"]
     model = best["model"]
     train_ds: PriceSequenceDataset = best["train_ds"]
 
+    # Скейлеры для обратного преобразования при инференсе
     scalers_path = os.path.join(output_dir, "best_price_scalers.joblib")
-    joblib.dump({"price_scaler": train_ds.scaler_price, "news_scaler": train_ds.scaler_news}, scalers_path)
+    joblib.dump({"price_scaler": train_ds.scaler_price,
+                 "news_scaler": train_ds.scaler_news}, scalers_path)
 
+    # Модель: XGBoost -> joblib, PyTorch -> state_dict
     if name == "xgboost":
         model_path = os.path.join(output_dir, "best_price_xgboost_model.joblib")
         joblib.dump(model.model, model_path)
@@ -395,22 +471,19 @@ def save_best_model_bundle(
         model_path = os.path.join(output_dir, "best_price_torch_model.pt")
         torch.save(model.state_dict(), model_path)
 
-    probs = np.asarray(best["probs"])
+    # CSV с предсказаниями и реальными значениями
+    probs = np.asarray(best["preds"])
     targets = np.asarray(best["targets"])
     preds_path = os.path.join(output_dir, "best_price_predictions.csv")
-    pd.DataFrame(
-        {
-            "target": targets,
-            "predicted_probability": probs,
-        }
-    ).to_csv(preds_path, index=False)
+    pd.DataFrame({"target": targets, "predicted_probability": probs}).to_csv(preds_path, index=False)
 
+    # Метаданные: конфиг, метрики, пути к файлам
     meta = {
         "task": f"price_direction_{TASK_TYPE_PRICE}",
         "task_type": TASK_TYPE_PRICE,
         "best_model_name": name,
-        "selection_metric": get_metrics_config(TASK_TYPE_PRICE)['primary_metric'],
-        "best_metrics": metrics,
+        "selection_metric": get_metrics_config(TASK_TYPE_PRICE)["primary_metric"],
+        "best_metrics": best["metrics"],
         "feature_columns": feature_cols,
         "news_columns": news_cols,
         "nlp_columns": nlp_cols,
@@ -433,14 +506,14 @@ def save_best_model_bundle(
 
 
 if __name__ == "__main__":
+    # Параметры из experiment_config.py (или переопределённые через ClearML)
     models_to_test = logger.get_parameter("models_to_test", MODELS_TO_TEST)
     logger.connect_configuration({"models_to_test": models_to_test}, name=CLEARML_CONFIG_RUN)
     print(f"ClearML enabled={logger.is_enabled} | models_to_test={models_to_test}")
 
+    # Загрузка и подготовка данных
     df, feat_cols, news_cols, nlp_cols = load_and_prepare_data(
-        DATA_BTC_DAY_PATH,
-        DATA_BULL_PATH,
-        DATA_BEAR_PATH,
+        DATA_BTC_DAY_PATH, DATA_BULL_PATH, DATA_BEAR_PATH,
         start_date=logger.get_parameter("data_start_date", DATA_START_DATE),
         end_date=logger.get_parameter("data_end_date", DATA_END_DATE),
         forecast_horizon=logger.get_parameter("forecast_horizon", FORECAST_HORIZON),
@@ -455,56 +528,55 @@ if __name__ == "__main__":
     results: dict = {}
     best = None
 
+    # Обучение всех моделей по очереди
     for model_name in models_to_test:
         print(f"\nTraining: {model_name}")
-        model, probs, targets, metrics, train_ds = train_one_model(
-            df,
-            model_name,
-            feat_cols,
-            news_cols,
-            nlp_cols,
-            training_epochs=epochs,
-            batch_size=batch,
-            learning_rate=lr,
-            sequence_length=seq_len,
+        result = train_one_model(
+            df, model_name, feat_cols, news_cols, nlp_cols,
+            training_epochs=epochs, batch_size=batch,
+            learning_rate=lr, sequence_length=seq_len,
         )
-        results[model_name] = {
-            "metrics": metrics,
-            "probs": probs,
-            "targets": targets
-        }
 
-        # Dynamic logging for comparison
+        # Распаковка: torch-модели возвращают 7 элементов, XGBoost — 5
+        if len(result) == 7:
+            model, probs, targets, metrics, train_ds, train_losses, val_losses = result
+            results[model_name] = {
+                "metrics": metrics, "preds": probs, "targets": targets,
+                "train_losses": train_losses, "val_losses": val_losses
+            }
+        else:
+            model, probs, targets, metrics, train_ds = result
+            results[model_name] = {"metrics": metrics, "preds": probs, "targets": targets}
+
+        # Логируем все метрики в ClearML
         for metric_name, value in metrics.items():
             logger.report_scalar(
                 CLEARML_TITLE_COMPARISON,
                 comparison_scalar_series(metric_name, model_name),
-                value,
-                0,
+                value, 0,
             )
 
-        # Select best model by primary metric
+        # Выбираем лучшую модель по основной метрике (ROC AUC)
         current_value = get_primary_metric_value(metrics, TASK_TYPE_PRICE)
-        best_value = get_primary_metric_value(best["metrics"], TASK_TYPE_PRICE) if best else float('-inf')
-        
+        best_value = get_primary_metric_value(best["metrics"], TASK_TYPE_PRICE) if best else float("-inf")
+
         if best is None or current_value > best_value:
+            best_result = result
+            if len(best_result) == 7:
+                _, _, _, _, _, best_train_losses, best_val_losses = best_result
+            else:
+                best_train_losses, best_val_losses = [], []
             best = {
-                "model_name": model_name,
-                "model": model,
-                "metrics": metrics,
-                "probs": probs,
-                "targets": targets,
-                "sequence_length": seq_len,
-                "train_ds": train_ds,
+                "model_name": model_name, "model": model, "metrics": metrics,
+                "preds": probs, "y_score": probs, "targets": targets,
+                "train_losses": best_train_losses, "val_losses": best_val_losses,
+                "sequence_length": seq_len, "train_ds": train_ds,
             }
 
-    # All metrics as columns
-    primary_metric = get_metrics_config(TASK_TYPE_PRICE)['primary_metric']
+    # Таблица сравнения моделей
+    primary_metric = get_metrics_config(TASK_TYPE_PRICE)["primary_metric"]
     comparison_df = (
-        pd.DataFrame(
-            [results[m]["metrics"] for m in results
-        ]
-        )
+        pd.DataFrame([results[m]["metrics"] for m in results])
         .sort_values(primary_metric, ascending=False)
         .reset_index(drop=True)
     )
@@ -517,13 +589,70 @@ if __name__ == "__main__":
     logger.report_table("model_comparison_table", "summary", comparison_df.round(4), 0)
     logger.upload_artifact("price_model_comparison_csv", comparison_path)
 
-    print(f"\nModel comparison (sorted by {get_metrics_config(TASK_TYPE_PRICE)['primary_metric']}):")
+    print(f"\nModel comparison (sorted by {primary_metric}):")
     print(comparison_df.to_string(index=False))
-    
+
     best_metrics_str = " | ".join([f"{k}={v:.4f}" for k, v in best["metrics"].items()])
     print(f"\nBest model: {best['model_name']} | {best_metrics_str}")
 
+    # Сохранение артефактов лучшей модели
     save_best_model_bundle(best, feat_cols, news_cols, nlp_cols)
+
+    # =============================================================================
+    #  Построение и загрузка графиков в ClearML
+    # =============================================================================
+    enable_clearml = logger._ENABLE_CLEARML if hasattr(logger, "_ENABLE_CLEARML") else True
+
+    # Кривые обучения для всех нейросетевых моделей
+    for model_name in results:
+        if results[model_name].get("train_losses"):
+            tl = results[model_name]["train_losses"]
+            vl = results[model_name]["val_losses"]
+            plot_training_losses(tl, vl, model_name,
+                                 save_path=f"{ARTIFACTS_DIR}/{model_name}_training_losses.png",
+                                 logger=logger if enable_clearml else None,
+                                 title_suffix="Price")
+
+    # Сравнение моделей (bar chart)
+    plot_model_comparison(results, primary_metric, TASK_TYPE_PRICE,
+                          save_path=f"{ARTIFACTS_DIR}/price_model_comparison.png",
+                          logger=logger if enable_clearml else None,
+                          title_suffix="Price")
+
+    # Предсказания лучшей модели: scatter + residuals
+    plot_prediction_scatter(
+        best["targets"], best["preds"], best["model_name"],
+        task_type=TASK_TYPE_PRICE,
+        save_path=f"{ARTIFACTS_DIR}/best_price_prediction_scatter.png",
+        logger=logger if enable_clearml else None,
+        title_suffix="Price",
+    )
+
+    # Распределение вероятностей предсказаний
+    plot_prediction_distribution(
+        best["targets"], best["preds"], best["model_name"],
+        task_type=TASK_TYPE_PRICE,
+        save_path=f"{ARTIFACTS_DIR}/best_price_prediction_distribution.png",
+        logger=logger if enable_clearml else None,
+        title_suffix="Price",
+    )
+
+    # ROC-кривая
+    y_score = best.get("y_score", best["preds"])
+    plot_roc_curve(
+        best["targets"], y_score, best["model_name"],
+        save_path=f"{ARTIFACTS_DIR}/best_price_roc_curve.png",
+        logger=logger if enable_clearml else None,
+        title_suffix="Price",
+    )
+
+    # Матрица ошибок
+    plot_confusion_matrix(
+        best["targets"], best["preds"], best["model_name"],
+        save_path=f"{ARTIFACTS_DIR}/best_price_confusion_matrix.png",
+        logger=logger if enable_clearml else None,
+        title_suffix="Price",
+    )
 
     logger.mark_completed()
     logger.close()

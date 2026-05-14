@@ -27,6 +27,10 @@ DATA_BULL_PATH = DATA_DIR / DATA_FILE_BULL
 CLEARML_PROJECT_NAME = "CryptoForecast"
 CLEARML_TASK_VERSION = "v5"
 CLEARML_REUSE_LAST_TASK_ID = False
+CLEARML_TITLE_TRAINING_LOSS = "Training/Loss"
+
+# Флаг включения ClearML
+ENABLE_CLEARML = True  # ← измените на False для отключения
 
 # --- Модели для сравнения и тип задачи (должны быть до функций) ---
 # Изменить здесь:
@@ -34,7 +38,7 @@ CLEARML_REUSE_LAST_TASK_ID = False
 #   MODELS_TO_TEST: какие модели тестировать ["liquid", "densenet", "resnet", "xgboost"]
 TASK_TYPE_PRICE = "classification"
 TASK_TYPE_VOLATILITY = "regression"
-MODELS_TO_TEST = ["densenet"]
+MODELS_TO_TEST = ["liquid", "densenet", "resnet", "xgboost"]
 CLASSIFICATION_THRESHOLD = 0.5
 
 # Динамические имена задач (формируются из MODELS_TO_TEST + TASK_TYPE)
@@ -47,13 +51,13 @@ CLEARML_TASK_NAME_PRICE = _make_task_name("price", MODELS_TO_TEST, TASK_TYPE_PRI
 CLEARML_TASK_NAME_VOLATILITY = _make_task_name("volatility", MODELS_TO_TEST, TASK_TYPE_VOLATILITY, CLEARML_TASK_VERSION)
 
 # --- Даты и окна ---
-DATA_START_DATE = "2025-01-16"
-DATA_END_DATE = "2025-12-16"
+DATA_START_DATE = "2024-03-15"
+DATA_END_DATE = "2026-02-16"
 FORECAST_HORIZON = 3
 VOLATILITY_WINDOW = 5
 
 # --- NLP ---
-USE_NLP = True
+USE_NLP = False  # отключено для отладки
 USE_NEWS_FILTER = True
 
 # Для Ollama: "qwen3-embedding:0.6b" или "mxbai-embed-large"
@@ -68,10 +72,10 @@ NLP_MAX_EMBEDDING_DIM = 64
 # --- Обучение (общие имена для логов и конфигов) ---
 SEQUENCE_LENGTH = 25
 TIME_SERIES_CV_SPLITS = 3
-TRAINING_EPOCHS = 40
+TRAINING_EPOCHS = 30
 BATCH_SIZE = 32
-LEARNING_RATE = 0.0015
-WEIGHT_DECAY = 1e-4
+LEARNING_RATE = 0.0005
+WEIGHT_DECAY = 1e-5
 HIDDEN_DIM_DEFAULT = 64
 HIDDEN_DIM_LIQUID = 48
 HUBER_LOSS_DELTA = 0.5
@@ -81,13 +85,19 @@ XGBOOST_FLATTEN_BATCH_SIZE = 1024
 # Можно менять под ОС/окружение без правок в коде моделей.
 # macOS (особенно Apple Silicon, если были segfault): держите 1 поток.
 # Windows: обычно можно повысить до 2-4 (или до числа физических ядер), если стабильно.
-XGBOOST_N_JOBS = 1
-XGBOOST_NTHREAD = 1
+XGBOOST_N_JOBS = 4
+XGBOOST_NTHREAD = 4
 # macOS: обычно "1" для стабильности OpenMP/libomp.
 # Windows: можно пробовать "2"/"4" и выше при стабильной работе.
-OMP_NUM_THREADS = "1"
-OPENBLAS_NUM_THREADS = "1"
-MKL_NUM_THREADS = "1"
+OMP_NUM_THREADS = "4"
+OPENBLAS_NUM_THREADS = "4"
+MKL_NUM_THREADS = "4"
+
+# --- Early Stopping Parameters ---
+EARLY_STOPPING_PATIENCE = 7
+EARLY_STOPPING_DELTA = 0.001
+GRADIENT_CLIP_VALUE = 1.0
+MKL_NUM_THREADS = "4"
 
 # --- Технические индикаторы (свечи) ---
 ROLLING_VOLATILITY_SHORT = 5
@@ -96,7 +106,7 @@ RSI_WINDOW = 14
 EMA_FAST = 12
 EMA_SLOW = 26
 
-# --- Артефакты (относительно текущей рабочей директории при запуске) ---
+# --- Артефакты ---
 ARTIFACTS_DIR = "artifacts"
 
 # --- Имена для отчётов ClearML (единый словарь, чтобы не разъезжались строки) ---
@@ -132,21 +142,36 @@ def clearml_base_parameters() -> dict:
         "hidden_dim_default": HIDDEN_DIM_DEFAULT,
         "hidden_dim_liquid": HIDDEN_DIM_LIQUID,
         "huber_loss_delta": HUBER_LOSS_DELTA,
+        "early_stopping_patience": 7,
+        "early_stopping_delta": 0.001,
+        "gradient_clip_value": 1.0,
         "xgboost_n_jobs": XGBOOST_N_JOBS,
-        "xgboost_nthread": XGBOOST_NTHREAD,
-        "omp_num_threads": OMP_NUM_THREADS,
-        "openblas_num_threads": OPENBLAS_NUM_THREADS,
-        "mkl_num_threads": MKL_NUM_THREADS,
-        "artifacts_dir": ARTIFACTS_DIR,
+    "xgboost_nthread": XGBOOST_NTHREAD,
+    "omp_num_threads": OMP_NUM_THREADS,
+    "openblas_num_threads": OPENBLAS_NUM_THREADS,
+    "mkl_num_threads": MKL_NUM_THREADS,
+    "artifacts_dir": ARTIFACTS_DIR,
+    "early_stopping_patience": EARLY_STOPPING_PATIENCE,
+    "early_stopping_delta": EARLY_STOPPING_DELTA,
+    "gradient_clip_value": GRADIENT_CLIP_VALUE,
     }
 
 
 def training_config_dict(model_name: str) -> dict:
     """Конфиг одного прогона обучения (для connect_configuration)."""
     return {
-        "model_name": model_name,
-        "sequence_length": SEQUENCE_LENGTH,
-        "training_epochs": TRAINING_EPOCHS,
+    "model_name": model_name,
+    "sequence_length": SEQUENCE_LENGTH,
+    "training_epochs": TRAINING_EPOCHS,
+    "batch_size": BATCH_SIZE,
+    "learning_rate": LEARNING_RATE,
+    "weight_decay": WEIGHT_DECAY,
+    "hidden_dim_default": HIDDEN_DIM_DEFAULT,
+    "hidden_dim_liquid": HIDDEN_DIM_LIQUID,
+    "huber_loss_delta": HUBER_LOSS_DELTA,
+    "early_stopping_patience": EARLY_STOPPING_PATIENCE,
+    "early_stopping_delta": EARLY_STOPPING_DELTA,
+    "gradient_clip_value": GRADIENT_CLIP_VALUE,
         "batch_size": BATCH_SIZE,
         "learning_rate": LEARNING_RATE,
         "weight_decay": WEIGHT_DECAY,
