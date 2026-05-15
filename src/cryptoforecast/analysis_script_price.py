@@ -217,13 +217,16 @@ def load_and_prepare_data(candles_path, bull_path, bear_path,
     nlp_cols: list[str] = []
     if use_nlp:
         encoder = NewsTitleEncoder(model_name=NLP_SENTENCE_MODEL_NAME)
-        news_with_emb = aggregate_news_embeddings_with_votes(all_news, encoder,
-                                                             max_emb_dim=NLP_MAX_EMBEDDING_DIM)
-        news_daily = aggregate_news_weighted(all_news, date_col="datetime", sentiment_col="sentiment_score")
-        news_daily = news_daily.merge(news_with_emb, on="date", how="left")
-        nlp_cols = [c for c in news_daily.columns if "nlp_emb" in c]
+        news_with_emb = aggregate_news_embeddings_with_votes(
+            all_news, encoder, max_emb_dim=NLP_MAX_EMBEDDING_DIM)
+        nlp_cols = [c for c in news_with_emb.columns if c != "date"]
+        news_daily = aggregate_news_weighted(
+            all_news, date_col="datetime", sentiment_col="sentiment_score")
+        for col in nlp_cols:
+            news_daily[col] = news_with_emb.set_index("date")[col].reindex(news_daily["date"]).values
     else:
-        news_daily = aggregate_news_weighted(all_news, date_col="datetime", sentiment_col="sentiment_score")
+        news_daily = aggregate_news_weighted(
+            all_news, date_col="datetime", sentiment_col="sentiment_score")
 
     # Объединение свечей с новостями
     candles["date"] = pd.to_datetime(candles["Open time"].dt.date)

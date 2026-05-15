@@ -57,7 +57,7 @@ FORECAST_HORIZON = 3
 VOLATILITY_WINDOW = 5
 
 # --- NLP ---
-USE_NLP = False  # отключено для отладки
+USE_NLP = True  # отключено для отладки
 # --- News filtering ---
 USE_NEWS_FILTER = True
 NEWS_FILTER_MIN_TOTAL_VOTES = 3
