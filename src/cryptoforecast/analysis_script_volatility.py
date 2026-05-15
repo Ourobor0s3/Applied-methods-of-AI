@@ -69,6 +69,14 @@ from experiment_config import (
     TIME_SERIES_CV_SPLITS,
     TRAINING_EPOCHS,
     USE_NLP,
+    USE_NEWS_FILTER,
+    NEWS_FILTER_MIN_TOTAL_VOTES,
+    NEWS_FILTER_MIN_POSITIVE_VOTES,
+    NEWS_FILTER_MIN_REACTION_INTENSITY,
+    NEWS_FILTER_MAX_TITLE_LENGTH,
+    NEWS_FILTER_MIN_TITLE_LENGTH,
+    NEWS_FILTER_SPAM_KEYWORDS,
+    NEWS_FILTER_QUALITY_THRESHOLD,
     VOLATILITY_WINDOW,
     VOLUME_MA_WINDOW,
     WEIGHT_DECAY,
@@ -81,7 +89,8 @@ from experiment_config import (
     training_config_dict,
 )
 from models_factory import create_model
-from nlp_features import NewsTitleEncoder, aggregate_news_embeddings_with_votes, create_enhanced_vote_features
+from nlp_features import NewsTitleEncoder, aggregate_news_embeddings_with_votes
+from news_filters import aggregate_news_weighted, filter_news
 from utils import (
     should_stop_early,
     plot_training_losses,
@@ -211,7 +220,8 @@ def load_and_prepare_data(candles_path, bull_path, bear_path,
                             start_date=DATA_START_DATE, end_date=DATA_END_DATE,
                             forecast_horizon=FORECAST_HORIZON,
                             volatility_window=VOLATILITY_WINDOW,
-                            use_nlp=USE_NLP):
+                            use_nlp=USE_NLP,
+                            use_news_filter=USE_NEWS_FILTER):
     """Загружает свечи и новости, создаёт признаки и таргет.
 
     Признаки (ценовые):
@@ -237,7 +247,8 @@ def load_and_prepare_data(candles_path, bull_path, bear_path,
     logger.connect_configuration(
         {"start_date": start_date, "end_date": end_date,
          "forecast_horizon": forecast_horizon, "volatility_window": volatility_window,
-         "use_nlp": use_nlp, "nlp_sentence_model_name": NLP_SENTENCE_MODEL_NAME},
+         "use_nlp": use_nlp, "nlp_sentence_model_name": NLP_SENTENCE_MODEL_NAME,
+         "use_news_filter": use_news_filter},
         name=CLEARML_CONFIG_DATA,
     )
 
@@ -254,6 +265,32 @@ def load_and_prepare_data(candles_path, bull_path, bear_path,
     bull["negative_votes"] = 0
     bear["positive_votes"] = 0
     all_news = pd.concat([bull, bear], ignore_index=True)
+
+    # Предварительная фильтрация новостей
+    if use_news_filter:
+        all_news, filter_stats = filter_news(
+            all_news,
+            use_filter=True,
+            min_total_votes=NEWS_FILTER_MIN_TOTAL_VOTES,
+            min_positive_votes=NEWS_FILTER_MIN_POSITIVE_VOTES,
+            min_reaction_intensity=NEWS_FILTER_MIN_REACTION_INTENSITY,
+            min_title_length=NEWS_FILTER_MIN_TITLE_LENGTH,
+            max_title_length=NEWS_FILTER_MAX_TITLE_LENGTH,
+            spam_keywords=NEWS_FILTER_SPAM_KEYWORDS,
+            min_quality=NEWS_FILTER_QUALITY_THRESHOLD,
+        )
+        logger.report_scalar("News Filtering", "initial_count", float(filter_stats["total_initial"]), 0)
+        logger.report_scalar("News Filtering", "remaining_count", float(filter_stats["total_remaining"]), 0)
+        logger.report_scalar("News Filtering", "credibility_dropped", float(filter_stats["credibility_dropped"]), 0)
+        logger.report_scalar("News Filtering", "relevance_dropped", float(filter_stats["relevance_dropped"]), 0)
+        logger.report_scalar("News Filtering", "quality_dropped", float(filter_stats["quality_dropped"]), 0)
+        logger.report_scalar("News Filtering", "total_dropped", float(filter_stats["total_dropped"]), 0)
+        print(f"[Filter] Initial: {filter_stats['total_initial']} | "
+              f"Remaining: {filter_stats['total_remaining']} | "
+              f"Dropped: {filter_stats['total_dropped']} "
+              f"(cred={filter_stats['credibility_dropped']}, "
+              f"rel={filter_stats['relevance_dropped']}, "
+              f"qual={filter_stats['quality_dropped']})")
 
     # Фильтрация по периоду данных
     candles = candles[
@@ -286,46 +323,17 @@ def load_and_prepare_data(candles_path, bull_path, bear_path,
         - all_news["negative_votes"] * 0.8
     )
 
-    # Расширенные признаки голосов (reaction_intensity, consensus_score и пр.)
-    all_news = create_enhanced_vote_features(all_news)
-
     # NLP-эмбеддинги заголовков (опционально)
     nlp_cols: list[str] = []
     if use_nlp:
         encoder = NewsTitleEncoder(model_name=NLP_SENTENCE_MODEL_NAME)
         news_with_emb = aggregate_news_embeddings_with_votes(
             all_news, encoder, max_emb_dim=NLP_MAX_EMBEDDING_DIM)
-        news_agg = (
-            all_news.groupby(all_news["datetime"].dt.date)
-            .agg({
-                "sentiment_score": ["sum", "mean", "std"], "title": "count",
-                "sentiment_weighted": ["sum", "mean", "std"],
-                "total_votes": ["sum", "mean"],
-                "positive_ratio": ["mean"], "negative_ratio": ["mean"],
-                "reaction_intensity": ["mean", "std"], "consensus_score": ["mean", "std"]
-            })
-            .reset_index()
-        )
-        news_agg.columns = [
-            "date", "sentiment_sum", "sentiment_mean", "sentiment_std", "news_count",
-            "sentiment_weighted_sum", "sentiment_weighted_mean", "sentiment_weighted_std",
-            "total_votes_sum", "total_votes_mean", "positive_ratio_mean",
-            "negative_ratio_mean", "reaction_intensity_mean", "reaction_intensity_std",
-            "consensus_score_mean", "consensus_score_std"
-        ]
-        news_agg["date"] = pd.to_datetime(news_agg["date"])
-        news_daily = news_agg.merge(news_with_emb, on="date", how="left")
+        news_daily = aggregate_news_weighted(all_news, date_col="datetime", sentiment_col="sentiment_score")
+        news_daily = news_daily.merge(news_with_emb, on="date", how="left")
         nlp_cols = [c for c in news_daily.columns if "nlp_emb" in c]
     else:
-        all_news["date"] = all_news["datetime"].dt.date
-        news_daily = (
-            all_news.groupby("date")
-            .agg({"sentiment_score": ["sum", "mean", "std"], "title": "count"})
-            .reset_index()
-        )
-        news_daily.columns = ["date", "sentiment_sum", "sentiment_mean",
-                              "sentiment_std", "news_count"]
-        news_daily["date"] = pd.to_datetime(news_daily["date"])
+        news_daily = aggregate_news_weighted(all_news, date_col="datetime", sentiment_col="sentiment_score")
 
     # Объединение свечей с новостями по дате
     candles["date"] = pd.to_datetime(candles["Open time"].dt.date)
@@ -334,9 +342,11 @@ def load_and_prepare_data(candles_path, bull_path, bear_path,
     # Список новостных колонок (расширенный при USE_NLP=False)
     expected_news_cols = [
         "sentiment_sum", "sentiment_mean", "sentiment_std", "news_count",
-        "sentiment_weighted_sum", "sentiment_weighted_mean", "total_votes_mean",
-        "positive_ratio_mean", "negative_ratio_mean",
-        "reaction_intensity_mean", "consensus_score_mean",
+        "weighted_sentiment", "max_quality_sentiment",
+        "total_votes_sum", "total_votes_mean", "total_votes_max",
+        "reaction_sum", "reaction_mean", "reaction_max",
+        "consensus_mean", "consensus_max",
+        "quality_mean", "quality_std", "quality_weighted_count",
     ]
     news_cols = [col for col in expected_news_cols if col in df.columns]
     for col in news_cols + nlp_cols:
@@ -574,6 +584,7 @@ if __name__ == "__main__":
         forecast_horizon=logger.get_parameter("forecast_horizon", FORECAST_HORIZON),
         volatility_window=logger.get_parameter("volatility_window", VOLATILITY_WINDOW),
         use_nlp=logger.get_parameter("use_nlp", USE_NLP),
+        use_news_filter=logger.get_parameter("use_news_filter", USE_NEWS_FILTER),
     )
 
     epochs = logger.get_parameter("training_epochs", TRAINING_EPOCHS)

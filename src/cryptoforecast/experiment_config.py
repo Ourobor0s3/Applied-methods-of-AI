@@ -25,7 +25,7 @@ DATA_BULL_PATH = DATA_DIR / DATA_FILE_BULL
 
 # --- ClearML ---
 CLEARML_PROJECT_NAME = "CryptoForecast"
-CLEARML_TASK_VERSION = "v5"
+CLEARML_TASK_VERSION = "v5_filtered"
 CLEARML_REUSE_LAST_TASK_ID = False
 CLEARML_TITLE_TRAINING_LOSS = "Training/Loss"
 
@@ -58,7 +58,15 @@ VOLATILITY_WINDOW = 5
 
 # --- NLP ---
 USE_NLP = False  # отключено для отладки
+# --- News filtering ---
 USE_NEWS_FILTER = True
+NEWS_FILTER_MIN_TOTAL_VOTES = 3
+NEWS_FILTER_MIN_POSITIVE_VOTES = 1
+NEWS_FILTER_MIN_REACTION_INTENSITY = 0.3
+NEWS_FILTER_MAX_TITLE_LENGTH = 300
+NEWS_FILTER_MIN_TITLE_LENGTH = 10
+NEWS_FILTER_SPAM_KEYWORDS: list[str] = ["click here", "subscribe", "win free", "buy now", "limited time"]
+NEWS_FILTER_QUALITY_THRESHOLD = 0.2
 
 # Для Ollama: "qwen3-embedding:0.6b" или "mxbai-embed-large"
 # Для установки olama нужно запустить скрипты (для макича):
