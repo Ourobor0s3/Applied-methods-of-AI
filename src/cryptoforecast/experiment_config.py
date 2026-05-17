@@ -25,7 +25,7 @@ DATA_BULL_PATH = DATA_DIR / DATA_FILE_BULL
 
 # --- ClearML ---
 CLEARML_PROJECT_NAME = "CryptoForecast"
-CLEARML_TASK_VERSION = "v5_filtered"
+CLEARML_TASK_VERSION = "v5_qwen:8b_256"
 CLEARML_REUSE_LAST_TASK_ID = False
 CLEARML_TITLE_TRAINING_LOSS = "Training/Loss"
 
@@ -72,10 +72,10 @@ NEWS_FILTER_QUALITY_THRESHOLD = 0.2
 # Для установки olama нужно запустить скрипты (для макича):
 # curl -fsSL https://ollama.com/install.sh | sh
 # ollama pull qwen3-embedding:0.6b
-# Для sentence-transformers: "Qwen/Qwen3-Embedding-0.5B" или "paraphrase-MiniLM-L6-v2"
-NLP_SENTENCE_MODEL_NAME = "qwen3-embedding:0.6b" # paraphrase-MiniLM-L6-v2
+# Для sentence-transformers: "qwen3-embedding:8b", "qwen3-embedding:0.6b" или "paraphrase-MiniLM-L6-v2"
+NLP_SENTENCE_MODEL_NAME = "qwen3-embedding:8b"
 # Максимальная размерность эмбеддингов после PCA (для избежания переполнения памяти в XGBoost)
-NLP_MAX_EMBEDDING_DIM = 64
+NLP_MAX_EMBEDDING_DIM = 256
 
 # --- Обучение (общие имена для логов и конфигов) ---
 SEQUENCE_LENGTH = 25
