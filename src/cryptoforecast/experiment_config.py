@@ -30,7 +30,7 @@ CLEARML_REUSE_LAST_TASK_ID = False
 CLEARML_TITLE_TRAINING_LOSS = "Training/Loss"
 
 # Флаг включения ClearML
-ENABLE_CLEARML = True  # ← измените на False для отключения
+ENABLE_CLEARML = False  # ← измените на False для отключения
 
 # --- Модели для сравнения и тип задачи (должны быть до функций) ---
 # Изменить здесь:
