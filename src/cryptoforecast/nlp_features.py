@@ -169,28 +169,12 @@ def create_enhanced_vote_features(df_news: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def reduce_embedding_dimension(embeddings: np.ndarray, max_dim: int = 64) -> np.ndarray:
-    """Уменьшение размерности эмбеддингов через PCA."""
-    if embeddings.shape[1] <= max_dim:
-        return embeddings
-    
-    try:
-        from sklearn.decomposition import PCA
-        pca = PCA(n_components=max_dim, random_state=42)
-        return pca.fit_transform(embeddings)
-    except Exception:
-        # Fallback: просто берем первые max_dim признаков
-        return embeddings[:, :max_dim]
-
-
 def aggregate_news_embeddings_with_votes(df_news: pd.DataFrame, 
                                        encoder: NewsTitleEncoder,
                                        date_col: str = 'datetime',
-                                       agg_methods: List[str] = None,
-                                       max_emb_dim: int = 64) -> pd.DataFrame:
+                                       agg_methods: List[str] = None) -> pd.DataFrame:
     """
     Агрегация эмбеддингов новостей и голосов по временным периодам.
-    max_emb_dim: максимальная размерность эмбеддингов (для избежания переполнения памяти)
     """
     if agg_methods is None:
         agg_methods = ['mean', 'max', 'std']
@@ -212,11 +196,6 @@ def aggregate_news_embeddings_with_votes(df_news: pd.DataFrame,
     # Кодируем заголовки
     _safe_log(f"Encoding {len(df_enhanced)} titles...")
     embeddings = encoder.transform(df_enhanced['title'].tolist())
-    
-    # Уменьшаем размерность если слишком много
-    if embeddings.shape[1] > max_emb_dim:
-        _safe_log(f"Reducing embedding dim: {embeddings.shape[1]} -> {max_emb_dim}")
-        embeddings = reduce_embedding_dimension(embeddings, max_emb_dim)
     
     # Добавляем эмбеддинги в DataFrame
     emb_cols = [f"nlp_emb_{i}" for i in range(embeddings.shape[1])]

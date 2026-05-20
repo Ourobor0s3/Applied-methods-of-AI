@@ -63,7 +63,6 @@ from experiment_config import (
     LEARNING_RATE,
     MODELS_TO_TEST,
     NLP_SENTENCE_MODEL_NAME,
-    NLP_MAX_EMBEDDING_DIM,
     RSI_WINDOW,
     SEQUENCE_LENGTH,
     TIME_SERIES_CV_SPLITS,
@@ -328,7 +327,7 @@ def load_and_prepare_data(candles_path, bull_path, bear_path,
     if use_nlp:
         encoder = NewsTitleEncoder(model_name=NLP_SENTENCE_MODEL_NAME)
         news_with_emb = aggregate_news_embeddings_with_votes(
-            all_news, encoder, max_emb_dim=NLP_MAX_EMBEDDING_DIM)
+            all_news, encoder)
         news_daily = aggregate_news_weighted(all_news, date_col="datetime", sentiment_col="sentiment_score")
         news_daily = news_daily.merge(news_with_emb, on="date", how="left")
         nlp_cols = [c for c in news_daily.columns if "nlp_emb" in c]

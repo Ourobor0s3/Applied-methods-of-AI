@@ -25,12 +25,12 @@ DATA_BULL_PATH = DATA_DIR / DATA_FILE_BULL
 
 # --- ClearML ---
 CLEARML_PROJECT_NAME = "CryptoForecast"
-CLEARML_TASK_VERSION = "v5_qwen:8b_256"
+CLEARML_TASK_VERSION = "v6"
 CLEARML_REUSE_LAST_TASK_ID = False
 CLEARML_TITLE_TRAINING_LOSS = "Training/Loss"
 
 # Флаг включения ClearML
-ENABLE_CLEARML = False  # ← измените на False для отключения
+ENABLE_CLEARML = True  # ← измените на False для отключения
 
 # --- Модели для сравнения и тип задачи (должны быть до функций) ---
 # Изменить здесь:
@@ -38,7 +38,7 @@ ENABLE_CLEARML = False  # ← измените на False для отключе�
 #   MODELS_TO_TEST: какие модели тестировать ["liquid", "densenet", "resnet", "xgboost"]
 TASK_TYPE_PRICE = "classification"
 TASK_TYPE_VOLATILITY = "regression"
-MODELS_TO_TEST = ["liquid", "densenet", "resnet", "xgboost"]
+MODELS_TO_TEST = ["liquid", "densenet", "resnet"]  # xgboost требует редукции эмбеддингов (OOM при 4096)
 CLASSIFICATION_THRESHOLD = 0.5
 
 # Динамические имена задач (формируются из MODELS_TO_TEST + TASK_TYPE)
@@ -74,8 +74,7 @@ NEWS_FILTER_QUALITY_THRESHOLD = 0.2
 # ollama pull qwen3-embedding:0.6b
 # Для sentence-transformers: "qwen3-embedding:8b", "qwen3-embedding:0.6b" или "paraphrase-MiniLM-L6-v2"
 NLP_SENTENCE_MODEL_NAME = "qwen3-embedding:8b"
-# Максимальная размерность эмбеддингов после PCA (для избежания переполнения памяти в XGBoost)
-NLP_MAX_EMBEDDING_DIM = 256
+
 
 # --- Обучение (общие имена для логов и конфигов) ---
 SEQUENCE_LENGTH = 25
